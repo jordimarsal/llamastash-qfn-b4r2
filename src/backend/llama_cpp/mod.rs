@@ -17,6 +17,7 @@ mod compose;
 mod effort;
 pub mod knobs;
 pub mod list_devices;
+mod prompt_cache;
 mod telemetry;
 
 use compose::compose;
@@ -32,6 +33,7 @@ use super::{
 };
 use crate::daemon::context::MethodContext;
 use crate::daemon::probe::ProbeOptions;
+use crate::daemon::registry::LaunchId;
 use crate::launch::params::LaunchParams;
 
 /// Config-derived launch-knob keys llama.cpp carries in
@@ -49,6 +51,18 @@ pub const LLAMACPP_KNOB_FIT_CTX_FLOOR: &str = "fit_ctx_floor";
 pub const LLAMACPP_KNOB_LOAD_MODE_DIALECT: &str = "load_mode_dialect";
 /// The same fact as a [`caps`] probe key on `Server::caps`.
 pub const CAP_LOAD_MODE_DIALECT: &str = "load_mode_dialect";
+/// `launch_config` keys for keeping a model's prompt cache across an unload:
+/// the directory the daemon would save to, and the one this launch was actually
+/// given (absent when the build has no `--slot-save-path`, when
+/// `backend.llamacpp.keep_prompt_cache` is off, or when `extras` owns the
+/// flag). Planned by [`prompt_cache::plan_save_dir`], confirmed by
+/// [`prompt_cache::enable_for_launch`] once the build has answered, read by
+/// `compose` and by the save / restore calls. Not user-settable.
+pub const LLAMACPP_KNOB_PROMPT_CACHE_DIR: &str = "prompt_cache_dir";
+pub const LLAMACPP_KNOB_SLOT_SAVE_PATH: &str = "slot_save_path";
+/// Whether a build can save a slot at all, as a [`caps`] probe key on
+/// `Server::caps`: the save/restore endpoints exist only behind the flag.
+pub const CAP_SLOT_SAVE: &str = "slot_save";
 
 /// The `fit_ctx_floor` launch knob parsed to `u32`, or `None` when unseeded /
 /// unparsable. Shared by the admission-floor and readiness-gate hooks.
@@ -160,6 +174,27 @@ pub struct LlamaCppConfig {
   /// sends an effort value on every request would otherwise always win.
   #[serde(default = "default_true")]
   pub map_anthropic_effort: bool,
+  /// Keep a llama.cpp model's prompt cache across an unload (factory `true`).
+  ///
+  /// When the proxy unloads an idle model — the idle sweep, or making room for
+  /// another — the next request to it would otherwise reprocess the whole
+  /// conversation. This saves each idle slot's KV state on the way out and
+  /// hands it to the next launch of that model before its first request, so a
+  /// continuation is charged for its new tokens only. Needs a `llama-server`
+  /// build with `--slot-save-path`; one without it is launched exactly as
+  /// before ([`caps::help_text`] is what asks).
+  #[serde(default = "default_true")]
+  pub keep_prompt_cache: bool,
+  /// How long kept prompt cache may go unused before it is dropped. Factory
+  /// 24 h; `0` expires it as fast as it can.
+  #[serde(default = "default_prompt_cache_ttl_secs")]
+  pub prompt_cache_ttl_secs: u64,
+  /// Total size of kept prompt cache across every model before the oldest is
+  /// dropped. A 32 k-token window on a 1 B model costs a few hundred MB, so
+  /// the cap is what bounds the directory, not the age. Factory 8 GiB; `0`
+  /// keeps nothing.
+  #[serde(default = "default_prompt_cache_max_bytes")]
+  pub prompt_cache_max_bytes: u64,
 }
 
 fn default_true() -> bool {
@@ -170,6 +205,14 @@ fn default_fit_ctx_floor() -> u32 {
   crate::config::DEFAULT_FIT_CTX_FLOOR
 }
 
+fn default_prompt_cache_ttl_secs() -> u64 {
+  prompt_cache::DEFAULT_TTL_SECS
+}
+
+fn default_prompt_cache_max_bytes() -> u64 {
+  prompt_cache::DEFAULT_MAX_BYTES
+}
+
 impl Default for LlamaCppConfig {
   fn default() -> Self {
     Self {
@@ -178,6 +221,9 @@ impl Default for LlamaCppConfig {
       strict_fit: false,
       fit_ctx_floor: crate::config::DEFAULT_FIT_CTX_FLOOR,
       map_anthropic_effort: true,
+      keep_prompt_cache: true,
+      prompt_cache_ttl_secs: prompt_cache::DEFAULT_TTL_SECS,
+      prompt_cache_max_bytes: prompt_cache::DEFAULT_MAX_BYTES,
     }
   }
 }
@@ -374,19 +420,25 @@ impl Backend for LlamaCppBackend {
   }
 
   fn probe_caps(&self, binary: &Path) -> std::collections::BTreeMap<String, String> {
+    // One `--help` read answers every spelling question about this build.
+    let help = caps::help_text(binary);
     let mut caps = std::collections::BTreeMap::new();
     caps.insert(
       CAP_LOAD_MODE_DIALECT.to_string(),
-      caps::LoadModeDialect::probe(binary).label().to_string(),
+      caps::LoadModeDialect::from_help(help.as_deref().unwrap_or_default())
+        .label()
+        .to_string(),
+    );
+    caps.insert(
+      CAP_SLOT_SAVE.to_string(),
+      prompt_cache::supported_in(help.as_deref().unwrap_or_default()).to_string(),
     );
     caps
   }
 
   fn seed_binary_caps(&self, binary: &Path, servers: &[super::Server], params: &mut LaunchParams) {
-    let dialect = match servers.iter().find(|s| s.binary == binary) {
-      Some(server) => caps::LoadModeDialect::from_label(
-        server.caps.get(CAP_LOAD_MODE_DIALECT).map(String::as_str),
-      ),
+    let caps = match servers.iter().find(|s| s.binary == binary) {
+      Some(server) => server.caps.clone(),
       // The binary should always be a catalog row (`configured_servers` adds the
       // daemon's resolved default), so a miss means the catalog and the launch
       // disagree. Probe rather than assume: guessing wrong here emits a flag the
@@ -396,13 +448,36 @@ impl Backend for LlamaCppBackend {
           "{} is not in the server catalog; probing its flags directly",
           binary.display()
         );
-        caps::LoadModeDialect::probe(binary)
+        self.probe_caps(binary)
       }
     };
+    let dialect = caps::LoadModeDialect::from_label(
+      caps.get(CAP_LOAD_MODE_DIALECT).map(String::as_str),
+    );
     params.launch_config.insert(
       LLAMACPP_KNOB_LOAD_MODE_DIALECT.to_string(),
       dialect.label().to_string(),
     );
+    // A build that does not advertise the flag is launched exactly as it was
+    // before this feature existed: no directory, no save, no restore.
+    prompt_cache::enable_for_launch(
+      params,
+      caps
+        .get(CAP_SLOT_SAVE)
+        .map(String::as_str)
+        .is_some_and(|s| s == "true"),
+    );
+  }
+
+  async fn save_prompt_cache(&self, ctx: &MethodContext, launch_id: &LaunchId) {
+    // Runs on the llama.cpp paths that stop a launch on purpose — the proxy idle
+    // sweep, make-room, `stop` — before the child is asked to exit. A slot still
+    // generating is left alone; see [`prompt_cache`].
+    prompt_cache::save_before_stop(ctx, launch_id).await;
+  }
+
+  async fn restore_prompt_cache(&self, ctx: &MethodContext, launch_id: &LaunchId) {
+    prompt_cache::restore_on_ready(ctx, launch_id).await;
   }
 
   fn launch_priority(&self) -> i32 {
@@ -462,6 +537,14 @@ impl Backend for LlamaCppBackend {
     params.launch_config.insert(
       LLAMACPP_KNOB_FIT_CTX_FLOOR.to_string(),
       cfg.fit_ctx_floor.to_string(),
+    );
+    // Prompt cache across an unload: plan the save directory here (path math
+    // only) because every later step — `compose`, the save on the way out, the
+    // restore on the way in — reads it off these params.
+    prompt_cache::plan_save_dir(
+      cfg,
+      ctx.launch.as_ref().map(|env| env.log_dir.as_path()),
+      params,
     );
   }
 

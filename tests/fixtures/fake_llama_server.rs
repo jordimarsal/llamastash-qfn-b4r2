@@ -25,6 +25,13 @@
 //! - `--print-env <VAR>` (test-only, repeatable — print `env VAR=<value>` to
 //!   stdout at start, so a test can read the child's environment from its log)
 //! - `--print-argv` (test-only — print `argv <args…>` to stdout at start)
+//! - `--slot-save-path <DIR>` — accepts the flag, and when it is set the
+//!   fixture serves `GET /slots` plus `POST /slots/<id>?action=save|restore`
+//!   like real llama-server: a save writes a file in `<DIR>`, a restore reads
+//!   one back and puts its prompt-token count into the slot. Off by default,
+//!   so a test's argv stays exactly what it was; `--help` only advertises the
+//!   flag when `FAKE_LLAMA_SLOT_SAVE=1`, which is how a test asks the daemon's
+//!   capability probe to say "this build can keep prompt state".
 //! - `--list-devices` (one-shot, mirrors real `llama-server`: prints a
 //!   fake adapter table and exits *without* serving). The number of
 //!   adapters comes from the `FAKE_LLAMA_DEVICES` env var, default `0`
@@ -72,6 +79,8 @@ struct Args {
   /// a real llama-server after generation — the fixture the status
   /// draft-acceptance scan asserts against.
   spec_mtp: bool,
+  /// `--slot-save-path <DIR>` — where slot save/restore files are written.
+  slot_save_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,6 +139,7 @@ fn parse_args() -> Args {
   let mut sigterm_exit_delay_ms = None;
   let mut print_env = Vec::new();
   let mut spec_mtp = false;
+  let mut slot_save_path = None;
   while let Some(arg) = args.next() {
     match arg.as_str() {
       "--host" => host = args.next().expect("--host needs value"),
@@ -149,6 +159,7 @@ fn parse_args() -> Args {
       "--sigterm-exit-delay-ms" => {
         sigterm_exit_delay_ms = args.next().and_then(|v| v.parse().ok());
       }
+      "--slot-save-path" => slot_save_path = args.next(),
       "--print-env" => print_env.extend(args.next()),
       // Silently ignore unknown flags so the supervisor can pass
       // through reasoning bundles + advanced overrides without
@@ -168,6 +179,7 @@ fn parse_args() -> Args {
     sigterm_exit_delay_ms,
     print_env,
     spec_mtp,
+    slot_save_path,
   }
 }
 
@@ -199,6 +211,11 @@ async fn main() {
       println!("      --mlock                          force system to keep model in RAM");
     } else {
       println!("-lm,   --load-mode MODE                 model loading mode (default: auto)");
+    }
+    // Opt-in, so a test that does not care about prompt state keeps the argv
+    // and the capability answer it has always had.
+    if std::env::var("FAKE_LLAMA_SLOT_SAVE").as_deref() == Ok("1") {
+      println!("      --slot-save-path PATH          path for saving slot contexts (default: none)");
     }
     return;
   }
@@ -270,6 +287,7 @@ async fn main() {
 
   let started_at = Arc::new(Instant::now());
   let args = Arc::new(args);
+  let slot = Arc::new(std::sync::Mutex::new(SlotState::default()));
   loop {
     let (sock, _) = match listener.accept().await {
       Ok(v) => v,
@@ -280,18 +298,28 @@ async fn main() {
     };
     let args = Arc::clone(&args);
     let started_at = Arc::clone(&started_at);
+    let slot = Arc::clone(&slot);
     tokio::spawn(async move {
-      if let Err(e) = handle(sock, args, started_at).await {
+      if let Err(e) = handle(sock, args, started_at, slot).await {
         eprintln!("connection error: {e}");
       }
     });
   }
 }
 
+/// What the fixture's single slot holds: the prompt tokens it has already
+/// evaluated. Real llama-server reports the same number on `/slots`, and a
+/// saved slot is only worth saving if there is something in it.
+#[derive(Debug, Default, Clone)]
+struct SlotState {
+  prompt_tokens: u64,
+}
+
 async fn handle(
   mut sock: TcpStream,
   args: Arc<Args>,
   started_at: Arc<Instant>,
+  slot: Arc<std::sync::Mutex<SlotState>>,
 ) -> std::io::Result<()> {
   let (rd, mut wr) = sock.split();
   let mut br = BufReader::new(rd);
@@ -394,6 +422,45 @@ async fn handle(
       )
       .await?;
     }
+    ("GET", p) if p == "/slots" || p.starts_with("/slots?") => {
+      let held = slot.lock().unwrap().prompt_tokens;
+      let n_ctx = args.ctx.or(args.fit_ctx).unwrap_or(4096);
+      let body = serde_json::json!([{
+        "id": 0,
+        "id_slot": 0,
+        "index": 0,
+        "slot_id": 0,
+        "state": 8,
+        "is_processing": false,
+        "speculative": false,
+        "n_ctx": n_ctx,
+        "n_ctx_seq": n_ctx,
+        "n_prompt_tokens": held,
+        "n_prompt_tokens_processed": held,
+        "n_prompt_tokens_cache": held,
+      }]);
+      write_response(
+        &mut wr,
+        200,
+        "application/json",
+        body.to_string().as_bytes(),
+      )
+      .await?;
+    }
+    ("POST", p) if p.starts_with("/slots/") => {
+      let (id_part, query) = p["/slots/".len()..].split_once('?').unwrap_or(("", ""));
+      let action = query
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("action="))
+        .unwrap_or_default();
+      let req_text = std::str::from_utf8(&body).unwrap_or("");
+      let filename = serde_json::from_str::<serde_json::Value>(req_text)
+        .ok()
+        .and_then(|v| v.get("filename").and_then(|f| f.as_str()).map(str::to_string));
+      let _ = id_part;
+      let (status, body) = slot_request(&args, &slot, action, filename.as_deref());
+      write_response(&mut wr, status, "application/json", body.as_bytes()).await?;
+    }
     ("POST", "/v1/chat/completions") => {
       // Test failure-injection knobs via query string:
       //   ?fail=400   → return a 400 with a JSON error body
@@ -411,6 +478,9 @@ async fn handle(
       // request body. The latter is convenient when the test
       // drives `spawn_chat_stream` which builds the URL itself.
       let body_text = std::str::from_utf8(&body).unwrap_or("");
+      // Whatever was just asked for stays in the slot: what a later
+      // `GET /slots` reports, and what a save is asked to keep.
+      note_prompt(&slot, body_text);
       let want_fail = query.contains("fail=400") || body_text.contains("__TEST_INJECT_FAIL_400__");
       let want_malformed =
         query.contains("malformed-sse=1") || body_text.contains("__TEST_INJECT_MALFORMED_SSE__");
@@ -575,6 +645,86 @@ async fn handle(
 fn extract_body_model(body: &str) -> Option<String> {
   let parsed: serde_json::Value = serde_json::from_str(body).ok()?;
   parsed.get("model")?.as_str().map(|s| s.to_string())
+}
+
+/// A rough prompt-token count for a request body: enough for one slot to carry
+/// a number that grows with the conversation, which is all the prompt-cache
+/// paths need in order to be observable.
+fn note_prompt(slot: &std::sync::Mutex<SlotState>, body: &str) {
+  let added = body.split_whitespace().count() as u64;
+  slot.lock().unwrap().prompt_tokens += added;
+}
+
+/// `POST /slots/<id>?action=save|restore`, answered the way real llama-server
+/// answers it: a save writes a file under `--slot-save-path`, a restore reads
+/// one back and puts the prompt it stands for into the slot — so a `GET /slots`
+/// after a restore shows the tokens the previous process had.
+fn slot_request(
+  args: &Args,
+  slot: &std::sync::Mutex<SlotState>,
+  action: &str,
+  filename: Option<&str>,
+) -> (u16, String) {
+  let err = |message: String| (500, serde_json::json!({ "error": message }).to_string());
+  let Some(dir) = args.slot_save_path.as_deref() else {
+    return (
+      400,
+      r#"{"error":"server is not launched with --slot-save-path"}"#.to_string(),
+    );
+  };
+  let Some(name) = filename else {
+    return (400, r#"{"error":"filename is required"}"#.to_string());
+  };
+  let held = slot.lock().unwrap().prompt_tokens;
+  let path = std::path::Path::new(dir).join(name);
+  match action {
+    "save" => {
+      if let Err(e) = std::fs::create_dir_all(dir) {
+        return err(format!("failed to create {dir}: {e}"));
+      }
+      let payload = format!("prompt-tokens {held}\n");
+      if let Err(e) = std::fs::write(&path, &payload) {
+        return err(format!("failed to save slot {name}: {e}"));
+      }
+      (
+        200,
+        serde_json::json!({
+          "id_slot": 0,
+          "filename": name,
+          "n_saved": held,
+          "n_written": payload.len(),
+          "timings": { "save_ms": 0.4 },
+        })
+        .to_string(),
+      )
+    }
+    "restore" => match std::fs::read_to_string(&path) {
+      Ok(text) => {
+        let n = text
+          .trim()
+          .strip_prefix("prompt-tokens ")
+          .and_then(|v| v.parse().ok())
+          .unwrap_or(0);
+        slot.lock().unwrap().prompt_tokens = n;
+        (
+          200,
+          serde_json::json!({
+            "id_slot": 0,
+            "filename": name,
+            "n_restored": n,
+            "n_read": text.len(),
+            "timings": { "restore_ms": 0.4 },
+          })
+          .to_string(),
+        )
+      }
+      Err(e) => err(format!("failed to load slot {name}: {e}")),
+    },
+    other => (
+      400,
+      serde_json::json!({ "error": format!("unknown action: {other}") }).to_string(),
+    ),
+  }
 }
 
 async fn write_response<W>(wr: &mut W, status: u16, ctype: &str, body: &[u8]) -> std::io::Result<()>

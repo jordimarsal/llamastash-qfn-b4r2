@@ -110,6 +110,14 @@ pub(crate) fn compose(params: &LaunchParams, allocated_port: u16) -> Vec<OsStrin
     argv.push("--fit-ctx".into());
     argv.push(floor.to_string().into());
   }
+  // Prompt cache across an unload: the directory llama.cpp writes slot state to,
+  // and the only thing that makes its save/restore endpoints reachable. Seeded
+  // by `prompt_cache::enable_for_launch` for a build that advertises the flag,
+  // after creating the directory — llama.cpp checks the path while parsing argv.
+  if let Some(dir) = params.launch_config.get(super::LLAMACPP_KNOB_SLOT_SAVE_PATH) {
+    argv.push(super::prompt_cache::SLOT_SAVE_ARG.into());
+    argv.push(dir.clone().into());
+  }
   // Emit the device selector verbatim — exactly once. Empty / unset
   // means "let llama-server auto-select" (no flag).
   if let Some(sel) = params
@@ -358,6 +366,36 @@ mod tests {
     let p = base_params();
     let argv = strs(&compose(&p, 41100));
     assert!(!argv.iter().any(|a| a == "-c" || a == "--fit-ctx"));
+  }
+
+  /// The prompt-cache directory reaches the engine as `--slot-save-path`, which
+  /// is the only thing that makes llama.cpp's slot save/restore endpoints
+  /// reachable. The key is absent whenever the launch was not given one — an
+  /// unsupported build, a disabled config, or `extras` owning the flag.
+  #[test]
+  fn a_prompt_cache_directory_is_passed_to_the_engine() {
+    let mut p = base_params();
+    p.launch_config.insert(
+      crate::backend::llama_cpp::LLAMACPP_KNOB_SLOT_SAVE_PATH.to_string(),
+      "/cache/prompt-cache".to_string(),
+    );
+    let argv = strs(&compose(&p, 41100));
+    let at = argv
+      .iter()
+      .position(|a| a == "--slot-save-path")
+      .expect("flag emitted");
+    assert_eq!(argv[at + 1], "/cache/prompt-cache");
+    assert_eq!(
+      argv.iter().filter(|a| *a == "--slot-save-path").count(),
+      1,
+      "once — llama-server honours the last occurrence"
+    );
+  }
+
+  #[test]
+  fn no_directory_means_no_flag() {
+    let argv = strs(&compose(&base_params(), 41100));
+    assert!(!argv.iter().any(|a| a == "--slot-save-path"));
   }
 
   #[test]
