@@ -17,10 +17,16 @@ mod compose;
 mod effort;
 pub mod knobs;
 pub mod list_devices;
+mod prompt_cache;
 mod telemetry;
 
 use compose::compose;
 pub use list_devices::{parse_list_devices, probe_devices, BinaryDevice};
+pub use prompt_cache::{
+  CAP_SLOT_SAVE, DEFAULT_PROMPT_CACHE_MAX_AGE_SECS, DEFAULT_PROMPT_CACHE_MAX_MIB,
+  LLAMACPP_KNOB_PROMPT_CACHE_DIR, LLAMACPP_KNOB_PROMPT_CACHE_MAX_AGE_SECS,
+  LLAMACPP_KNOB_PROMPT_CACHE_MAX_BYTES,
+};
 
 use std::path::{Path, PathBuf};
 
@@ -160,6 +166,19 @@ pub struct LlamaCppConfig {
   /// sends an effort value on every request would otherwise always win.
   #[serde(default = "default_true")]
   pub map_anthropic_effort: bool,
+  /// Keep a launch's prompt cache across an unload —
+  /// `backend.llamacpp.prompt_cache_max_mib`: the disk budget, in MiB, shared
+  /// by every model the daemon has kept state for. Factory
+  /// [`DEFAULT_PROMPT_CACHE_MAX_MIB`]. `0` turns the feature off: no
+  /// `--slot-save-path`, no save, no restore. See
+  /// [`prompt_cache`](prompt_cache) for what is written and when.
+  #[serde(default = "default_prompt_cache_max_mib")]
+  pub prompt_cache_max_mib: u32,
+  /// How long kept state may sit before it is dropped rather than read back —
+  /// `backend.llamacpp.prompt_cache_max_age_secs`. Factory
+  /// [`DEFAULT_PROMPT_CACHE_MAX_AGE_SECS`]; `0` keeps it indefinitely.
+  #[serde(default = "default_prompt_cache_max_age_secs")]
+  pub prompt_cache_max_age_secs: u64,
 }
 
 fn default_true() -> bool {
@@ -170,6 +189,14 @@ fn default_fit_ctx_floor() -> u32 {
   crate::config::DEFAULT_FIT_CTX_FLOOR
 }
 
+fn default_prompt_cache_max_mib() -> u32 {
+  prompt_cache::DEFAULT_PROMPT_CACHE_MAX_MIB
+}
+
+fn default_prompt_cache_max_age_secs() -> u64 {
+  prompt_cache::DEFAULT_PROMPT_CACHE_MAX_AGE_SECS
+}
+
 impl Default for LlamaCppConfig {
   fn default() -> Self {
     Self {
@@ -178,6 +205,8 @@ impl Default for LlamaCppConfig {
       strict_fit: false,
       fit_ctx_floor: crate::config::DEFAULT_FIT_CTX_FLOOR,
       map_anthropic_effort: true,
+      prompt_cache_max_mib: default_prompt_cache_max_mib(),
+      prompt_cache_max_age_secs: default_prompt_cache_max_age_secs(),
     }
   }
 }
@@ -374,18 +403,23 @@ impl Backend for LlamaCppBackend {
   }
 
   fn probe_caps(&self, binary: &Path) -> std::collections::BTreeMap<String, String> {
+    let probed = caps::read(binary);
     let mut caps = std::collections::BTreeMap::new();
     caps.insert(
       CAP_LOAD_MODE_DIALECT.to_string(),
-      caps::LoadModeDialect::probe(binary).label().to_string(),
+      probed.load_mode.label().to_string(),
     );
+    caps.insert(CAP_SLOT_SAVE.to_string(), probed.slot_save.to_string());
     caps
   }
 
   fn seed_binary_caps(&self, binary: &Path, servers: &[super::Server], params: &mut LaunchParams) {
-    let dialect = match servers.iter().find(|s| s.binary == binary) {
-      Some(server) => caps::LoadModeDialect::from_label(
-        server.caps.get(CAP_LOAD_MODE_DIALECT).map(String::as_str),
+    let (dialect, slot_save) = match servers.iter().find(|s| s.binary == binary) {
+      Some(server) => (
+        caps::LoadModeDialect::from_label(
+          server.caps.get(CAP_LOAD_MODE_DIALECT).map(String::as_str),
+        ),
+        server.caps.get(CAP_SLOT_SAVE).is_some_and(|v| v == "true"),
       ),
       // The binary should always be a catalog row (`configured_servers` adds the
       // daemon's resolved default), so a miss means the catalog and the launch
@@ -396,13 +430,22 @@ impl Backend for LlamaCppBackend {
           "{} is not in the server catalog; probing its flags directly",
           binary.display()
         );
-        caps::LoadModeDialect::probe(binary)
+        let probed = caps::read(binary);
+        (probed.load_mode, probed.slot_save)
       }
     };
     params.launch_config.insert(
       LLAMACPP_KNOB_LOAD_MODE_DIALECT.to_string(),
       dialect.label().to_string(),
     );
+    // The engine's half of keeping a prompt cache is `--slot-save-path` and the
+    // slot save / restore endpoints. A build that predates them is not handed a
+    // flag it would reject, so the directory `seed_launch_knobs` projected comes
+    // back off here — which is also what keeps `--slot-save-path` out of the
+    // argv of a build that would not start with it.
+    if !slot_save {
+      params.launch_config.remove(LLAMACPP_KNOB_PROMPT_CACHE_DIR);
+    }
   }
 
   fn launch_priority(&self) -> i32 {
@@ -463,6 +506,76 @@ impl Backend for LlamaCppBackend {
       LLAMACPP_KNOB_FIT_CTX_FLOOR.to_string(),
       cfg.fit_ctx_floor.to_string(),
     );
+    // Prompt cache across an unload: the directory this launch's slot dumps go
+    // to plus the two limits the save hook enforces, so the hooks need no config
+    // access of their own. Off for a launch when it has no conversation to keep
+    // (an embedding or rerank launch is asked something different every time),
+    // when the budget is `0`, or when the daemon has no launch environment to
+    // derive a cache path from; bench parity mode suppresses it exactly as it
+    // suppresses `--jinja`, keeping `start` byte-identical to raw
+    // `llama-server`. llama.cpp wants the directory to exist at launch, so it is
+    // created here, and a directory that cannot be created drops the key rather
+    // than launching a command the engine rejects.
+    let cache_dir = if params.mode == crate::launch::mode::LaunchMode::Chat
+      && cfg.prompt_cache_max_mib > 0
+      && !crate::launch::params::bench_disable_defaults_from_env()
+    {
+      ctx
+        .launch
+        .as_ref()
+        .and_then(|env| prompt_cache::cache_root(&env.log_dir))
+        .map(|root| prompt_cache::model_dir(&root, &params.model_path))
+    } else {
+      None
+    };
+    match cache_dir {
+      Some(dir) if std::fs::create_dir_all(&dir).is_ok() => {
+        params.launch_config.insert(
+          LLAMACPP_KNOB_PROMPT_CACHE_DIR.to_string(),
+          dir.display().to_string(),
+        );
+        params.launch_config.insert(
+          LLAMACPP_KNOB_PROMPT_CACHE_MAX_BYTES.to_string(),
+          (u64::from(cfg.prompt_cache_max_mib) * 1024 * 1024).to_string(),
+        );
+        params.launch_config.insert(
+          LLAMACPP_KNOB_PROMPT_CACHE_MAX_AGE_SECS.to_string(),
+          cfg.prompt_cache_max_age_secs.to_string(),
+        );
+      }
+      Some(dir) => log::warn!(
+        "prompt cache: cannot create {}: this launch will keep nothing",
+        dir.display()
+      ),
+      None => {
+        params.launch_config.remove(LLAMACPP_KNOB_PROMPT_CACHE_DIR);
+      }
+    }
+  }
+
+  /// An unload of a llama.cpp launch writes its idle slots to disk first — the
+  /// KV state exists only while the engine is up, and the whole point of the
+  /// keep is that the state outlives the process. The `model.stop` RPC and the
+  /// proxy's idle sweep and make-room calls all reach it; a daemon that is
+  /// exiting does not, and does not need a prompt kept for nothing. What the
+  /// launch was told to keep was decided when it was seeded, so this only has
+  /// to do the work.
+  async fn unload(
+    &self,
+    ctx: &MethodContext,
+    launch_id: &crate::daemon::registry::LaunchId,
+    grace_secs: u64,
+  ) -> Result<serde_json::Value, crate::ipc::protocol::ErrorObject> {
+    if let Some(model) = ctx.supervisors.get(launch_id).await {
+      prompt_cache::save_before_stop(&model).await;
+    }
+    Backend::stop(self, ctx, launch_id, grace_secs).await
+  }
+
+  /// …and a launch that reaches Ready reads back what an earlier launch of the
+  /// same model wrote. Spoken once per launch, before it can serve anything.
+  async fn after_launch_ready(&self, model: &crate::daemon::supervisor::ManagedModel) {
+    prompt_cache::restore_before_ready(model).await;
   }
 
   fn admission_ctx_floor(&self, params: &LaunchParams) -> Option<u32> {
@@ -775,6 +888,208 @@ mod tests {
     // resolving to the standalone server.
     let markers = LlamaCppBackend::new().process_markers();
     assert_eq!(markers, &["llama-server", "llama"]);
+  }
+
+  // ---- Keeping a prompt cache across an unload ----
+
+  fn server_row(binary: &Path, slot_save: bool) -> crate::backend::Server {
+    crate::backend::Server {
+      id: "llamacpp".into(),
+      backend_id: "llamacpp".into(),
+      binary: binary.to_path_buf(),
+      name: "llamacpp".into(),
+      devices: Vec::new(),
+      caps: std::collections::BTreeMap::from([(CAP_SLOT_SAVE.to_string(), slot_save.to_string())]),
+    }
+  }
+
+  /// Params as `seed_launch_knobs` would leave them: told where to keep.
+  fn params_told_to_keep() -> LaunchParams {
+    let mut p = LaunchParams::new(PathBuf::from("/m/model.gguf"), LaunchMode::Chat);
+    p.launch_config.insert(
+      LLAMACPP_KNOB_PROMPT_CACHE_DIR.to_string(),
+      "/cache/prompt-cache/model".into(),
+    );
+    p
+  }
+
+  fn kept_dir(params: &LaunchParams) -> Option<String> {
+    params
+      .launch_config
+      .get(LLAMACPP_KNOB_PROMPT_CACHE_DIR)
+      .cloned()
+  }
+
+  fn argv_of(params: &LaunchParams) -> Vec<String> {
+    compose(params, 41100)
+      .iter()
+      .map(|a| a.to_string_lossy().into_owned())
+      .collect()
+  }
+
+  fn ctx_with_cache_root(root: &Path, cfg: LlamaCppConfig) -> MethodContext {
+    let env = crate::daemon::context::LaunchEnv {
+      binary: None,
+      port_range: crate::config::loader::PortRange {
+        start: 41100,
+        end: 41100,
+      },
+      log_dir: root.join("logs"),
+      probe: ProbeOptions::default(),
+      arch_defaults: Default::default(),
+      servers: Default::default(),
+      default_launch_mode: Default::default(),
+    };
+    MethodContext::new(crate::daemon::shutdown::ShutdownToken::new())
+      .with_launch_env(env)
+      .with_backend(
+        crate::backend::BackendConfig {
+          llamacpp: cfg,
+          ..Default::default()
+        },
+        std::collections::BTreeMap::new(),
+      )
+  }
+
+  #[test]
+  fn a_build_with_the_slot_endpoints_is_launched_with_a_slot_save_path() {
+    let binary = PathBuf::from("/bin/llama-server");
+    let mut params = params_told_to_keep();
+    LlamaCppBackend::new().seed_binary_caps(&binary, &[server_row(&binary, true)], &mut params);
+    let argv = argv_of(&params);
+    let at = argv
+      .iter()
+      .position(|a| a == "--slot-save-path")
+      .expect("the directory a launch was given reaches the engine as a flag");
+    assert_eq!(argv[at + 1], "/cache/prompt-cache/model");
+  }
+
+  #[test]
+  fn a_build_without_them_is_given_neither_the_flag_nor_the_directory() {
+    // An unknown argument costs a whole failed load, so a build that predates
+    // the slot endpoints is left exactly as it was.
+    let binary = PathBuf::from("/bin/llama-server");
+    let mut params = params_told_to_keep();
+    LlamaCppBackend::new().seed_binary_caps(&binary, &[server_row(&binary, false)], &mut params);
+    assert_eq!(kept_dir(&params), None);
+    assert!(!argv_of(&params).iter().any(|a| a == "--slot-save-path"));
+  }
+
+  #[test]
+  fn a_binary_with_no_catalog_row_is_asked_directly_and_keeps_nothing_when_it_cannot_answer() {
+    let binary = PathBuf::from("/nonexistent/llama-server-xyz");
+    let mut params = params_told_to_keep();
+    LlamaCppBackend::new().seed_binary_caps(&binary, &[], &mut params);
+    assert_eq!(kept_dir(&params), None);
+    assert_eq!(
+      params
+        .launch_config
+        .get(LLAMACPP_KNOB_LOAD_MODE_DIALECT)
+        .map(String::as_str),
+      Some("flags"),
+      "the same one probe answers both questions"
+    );
+  }
+
+  #[test]
+  fn a_launch_is_seeded_a_directory_of_its_own_under_the_daemon_cache_root() {
+    let root = crate::util::test_temp::unique_temp_dir("seed-prompt-cache");
+    let ctx = ctx_with_cache_root(&root, LlamaCppConfig::default());
+    let b = LlamaCppBackend::new();
+
+    let mut first = LaunchParams::new(
+      PathBuf::from("/models/first/Llama-3.2-1B-Q4_K_M.gguf"),
+      LaunchMode::Chat,
+    );
+    b.seed_launch_knobs(&ctx, &mut first);
+    let dir = kept_dir(&first).expect("a chat launch is told where to keep its prompt cache");
+    let dir_path = Path::new(&dir);
+    assert!(dir_path.starts_with(root.join("prompt-cache")));
+    assert!(dir_path.exists(), "the engine wants the directory to exist");
+    assert!(
+      dir.contains("Llama-3.2-1B-Q4_K_M-"),
+      "recognizable in a listing"
+    );
+    // The limits travel with the directory, so neither hook needs config.
+    assert_eq!(
+      first
+        .launch_config
+        .get(LLAMACPP_KNOB_PROMPT_CACHE_MAX_BYTES)
+        .map(String::as_str),
+      Some("8589934592")
+    );
+    assert_eq!(
+      first
+        .launch_config
+        .get(LLAMACPP_KNOB_PROMPT_CACHE_MAX_AGE_SECS)
+        .map(String::as_str),
+      Some("3600")
+    );
+
+    let mut other = LaunchParams::new(
+      PathBuf::from("/models/second/Llama-3.2-1B-Q4_K_M.gguf"),
+      LaunchMode::Chat,
+    );
+    b.seed_launch_knobs(&ctx, &mut other);
+    assert_ne!(
+      kept_dir(&other).expect("second cache"),
+      dir,
+      "two models that share a file name must not share kept state"
+    );
+
+    let mut embedding = LaunchParams::new(
+      PathBuf::from("/models/first/Llama-3.2-1B-Q4_K_M.gguf"),
+      LaunchMode::Embedding,
+    );
+    b.seed_launch_knobs(&ctx, &mut embedding);
+    assert_eq!(
+      kept_dir(&embedding),
+      None,
+      "an embedding launch has no conversation to keep"
+    );
+
+    std::fs::remove_dir_all(&root).ok();
+  }
+
+  #[test]
+  fn a_zero_disk_budget_tells_a_launch_to_keep_nothing() {
+    let root = crate::util::test_temp::unique_temp_dir("seed-prompt-cache-off");
+    let ctx = ctx_with_cache_root(
+      &root,
+      LlamaCppConfig {
+        prompt_cache_max_mib: 0,
+        ..Default::default()
+      },
+    );
+    let mut params = LaunchParams::new(PathBuf::from("/models/x.gguf"), LaunchMode::Chat);
+    LlamaCppBackend::new().seed_launch_knobs(&ctx, &mut params);
+    assert_eq!(kept_dir(&params), None);
+    assert!(!argv_of(&params).iter().any(|a| a == "--slot-save-path"));
+    assert!(
+      !root.join("prompt-cache").exists(),
+      "off means no directories either"
+    );
+    std::fs::remove_dir_all(&root).ok();
+  }
+
+  #[test]
+  fn the_two_limits_are_config_authorable_and_default_to_the_documented_factory_values() {
+    let cfg = LlamaCppConfig::default();
+    assert_eq!(
+      cfg.prompt_cache_max_mib,
+      prompt_cache::DEFAULT_PROMPT_CACHE_MAX_MIB
+    );
+    assert_eq!(
+      cfg.prompt_cache_max_age_secs,
+      prompt_cache::DEFAULT_PROMPT_CACHE_MAX_AGE_SECS
+    );
+    let cfg: LlamaCppConfig = serde_json::from_value(serde_json::json!({
+      "prompt_cache_max_mib": 512,
+      "prompt_cache_max_age_secs": 0,
+    }))
+    .expect("both keys are authorable in config.yaml");
+    assert_eq!(cfg.prompt_cache_max_mib, 512);
+    assert_eq!(cfg.prompt_cache_max_age_secs, 0);
   }
 
   // ---- Parity: prepare_launch argv == compose() byte-for-byte ----

@@ -20,6 +20,11 @@ All notable changes to LlamaStash will be documented in this file. The format fo
 - `/api/show` reads `<model>@<launch>` the way the chat surfaces do: the launch name is a pointer to a running launch, and a name that does not exist falls back to that model's unnamed launch. It used to answer `404` for anything containing an `@`. ([#99](https://github.com/llamastash/llamastash/pull/99))
 - The proxy reads the model catalog through one shared snapshot instead of copying every row for every request, so routing a request no longer allocates in proportion to how many models are on disk. ([#99](https://github.com/llamastash/llamastash/pull/99))
 
+### Added
+
+- **A llama.cpp model keeps its prompt when it is unloaded.** The launch that the idle sweep, an unload-to-make-room or a `stop` takes down now writes its processed prompt to disk first, and the model's next launch reads it back before its first request: a 99,005-token prompt that cost 8.6 s to read again costs 0.6 s to restore, and the request after it is answered from cache in 23 ms. Chat only, and only where llama.cpp has the slot save endpoints; a conversation that repeats nothing new simply reprocesses. ([#2](https://github.com/jordimarsal/llamastash-qfn-b4r2/pull/2))
+- `backend.llamacpp.prompt_cache_max_mib` and `prompt_cache_max_age_secs`: the disk budget a kept prompt cache may occupy (default 8192 MiB, `0` turns the feature off) and how long one is worth reading back (default 3600 s). Dumps land under `<cache-dir>/prompt-cache/`, one directory per model file, and are dropped oldest-first. Config-only. ([#2](https://github.com/jordimarsal/llamastash-qfn-b4r2/pull/2))
+
 ### Fixed
 
 - A model whose projector folder holds two precisions (`mmproj-BF16.gguf` beside `mmproj-F16.gguf`, as unsloth's Qwen3.8 repos publish them) is vision again. Neither name matches the model, so nothing paired: the row read `multimodal: null`, the launch carried no projector, and `integrations` wrote the model without image input. The projector now pairs by the precision order `pull` already uses, and one shared order settles both picks.

@@ -42,30 +42,7 @@ impl LoadModeDialect {
   /// itself will reject the argv with a message naming the flag. Guessing
   /// `Enum` there would turn a clear rejection into a confusing one.
   pub fn probe(binary: &Path) -> Self {
-    let mut cmd = Command::new(binary);
-    // The unified app takes server flags behind `serve`; `llama --help` prints
-    // the dispatcher's own help, which lists no server flags at all.
-    cmd.args(super::serve_prefix(binary));
-    cmd.arg("--help");
-    match crate::util::process::run_with_drain_and_timeout(cmd, HELP_TIMEOUT) {
-      Ok(out) => {
-        // Some builds print help on stderr, some on stdout; read both rather
-        // than depending on which.
-        let text = format!(
-          "{}{}",
-          String::from_utf8_lossy(&out.stdout),
-          String::from_utf8_lossy(&out.stderr)
-        );
-        Self::from_help(&text)
-      }
-      Err(e) => {
-        log::warn!(
-          "`{} --help` failed: {e:?}; assuming the pre-`--load-mode` flags",
-          binary.display()
-        );
-        Self::Flags
-      }
-    }
+    Self::from_help(&help_text(binary))
   }
 
   /// The parse, split out so tests drive it with captured help text instead of
@@ -93,6 +70,58 @@ impl LoadModeDialect {
     match label {
       Some("enum") => Self::Enum,
       _ => Self::Flags,
+    }
+  }
+}
+
+/// One `--help` run's worth of facts about a build.
+pub struct BuildCaps {
+  pub load_mode: LoadModeDialect,
+  /// Can keep a slot's KV state on disk: `--slot-save-path` plus the slot
+  /// save / restore endpoints. An older build without them is not given the
+  /// flag rather than failing a launch on an unknown argument.
+  pub slot_save: bool,
+}
+
+/// Ask one binary what it accepts. Everything here comes out of a single
+/// `--help`, so a launch never pays for the same probe twice.
+pub fn read(binary: &Path) -> BuildCaps {
+  let help = help_text(binary);
+  BuildCaps {
+    load_mode: LoadModeDialect::from_help(&help),
+    slot_save: advertises_slot_save(&help),
+  }
+}
+
+/// The literal flag is the answer: a build that can save a slot says so in its
+/// own usage text, and no version string can stand in for that (see the module
+/// note on `--load-mode`).
+fn advertises_slot_save(help: &str) -> bool {
+  help.contains("--slot-save-path")
+}
+
+fn help_text(binary: &Path) -> String {
+  let mut cmd = Command::new(binary);
+  // The unified app takes server flags behind `serve`; `llama --help` prints
+  // the dispatcher's own help, which lists no server flags at all.
+  cmd.args(super::serve_prefix(binary));
+  cmd.arg("--help");
+  match crate::util::process::run_with_drain_and_timeout(cmd, HELP_TIMEOUT) {
+    Ok(out) => {
+      // Some builds print help on stderr, some on stdout; read both rather
+      // than depending on which.
+      format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+      )
+    }
+    Err(e) => {
+      log::warn!(
+        "`{} --help` failed: {e:?}; assuming the pre-`--load-mode` flags",
+        binary.display()
+      );
+      String::new()
     }
   }
 }
@@ -146,5 +175,20 @@ mod tests {
       "params written before this key existed must still emit a spelling the \
        older builds accept"
     );
+  }
+
+  /// Captured from `llama-server --help` on build 11580 (commit `4413a1924`).
+  const SLOT_SAVE_HELP: &str = "\
+--slot-save-path PATH                   path to save slot kv cache (default: disabled)
+                                        (env: LLAMA_ARG_SLOT_SAVE_PATH)
+       --slots, --no-slots             enable / disable slots REST API endpoints
+";
+
+  #[test]
+  fn a_build_advertising_slot_save_can_keep_a_prompt_cache() {
+    assert!(advertises_slot_save(SLOT_SAVE_HELP));
+    // The captured pre-`--load-mode` help predates it.
+    assert!(!advertises_slot_save(OLD_HELP));
+    assert!(!advertises_slot_save(""));
   }
 }

@@ -110,6 +110,18 @@ pub(crate) fn compose(params: &LaunchParams, allocated_port: u16) -> Vec<OsStrin
     argv.push("--fit-ctx".into());
     argv.push(floor.to_string().into());
   }
+  // The directory this launch's slot KV dumps go to, seeded by
+  // `seed_launch_knobs` and taken back off when the resolved build has no slot
+  // save / restore endpoints (see `seed_binary_caps`). Unset is the feature off
+  // for this launch: llama.cpp keeps prompt caches in memory exactly as before.
+  if let Some(dir) = params
+    .launch_config
+    .get(crate::backend::llama_cpp::LLAMACPP_KNOB_PROMPT_CACHE_DIR)
+    .filter(|d| !d.is_empty())
+  {
+    argv.push("--slot-save-path".into());
+    argv.push(dir.clone().into());
+  }
   // Emit the device selector verbatim — exactly once. Empty / unset
   // means "let llama-server auto-select" (no flag).
   if let Some(sel) = params

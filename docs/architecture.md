@@ -160,6 +160,7 @@ A new backend is **one new module plus the minimum central wiring**; removing on
 | Discovery routing / `list` badge | `auto_routes` + `routed_backend_for` record the claiming ids on `DiscoveredModel.supported_backends` |
 | Launch selection + binary pick | `resolve_backend_for_launch` walks the registry (`auto_routes` + `available` + `serves_mode`, else the identity rule); executable/port pick is `resolve_launch_binary` |
 | Launch / stop execution | `compose_and_spawn` does the neutral prep (validate → identity/arch → port reserve → layered knobs → native-knob auto-resolve) into a `LaunchExec`, then calls `Backend::start`; `stop_model` resolves the owner via `backend_for_launch` and calls `Backend::stop`. The defaults are the supervised child spawn / SIGTERM (`spawn_supervised` / `stop_supervised`); a managed multiplexer overrides both to ensure or tear down its umbrella. The caller never branches on process-vs-umbrella. |
+| Keep state across an unload | `ManagedModel::stop` calls `Backends::before_unload` on every stop path, and the `Loading → Ready` transition calls `Backends::after_launch_ready`. Both are no-ops on the trait and neither names a backend or carries dispatch context; what a launch may keep is decided once by `seed_launch_knobs` and rides on its `launch_config`, so a launch that was told to keep nothing reaches both hooks with nothing to do. The supervisor, the idle sweep and make-room stay untouched |
 | Path → model identity | `resolve_identity_for_path` is the single resolver every surface uses (launch, proxy auto-start, favorites, preset-key lookup). It asks the registry via `synthetic_identity` first, so a directory- or registry-shaped model never reaches the GGUF header reader, and falls back to one header read that also yields arch / native ctx / `supported_backends`. A new model shape is one predicate, not one edit per surface. |
 | Pre-spawn refusal | `refusal_for_auto_launch` asks every backend via `refuses` |
 | KV memory model | `gguf::memory::kv_bytes` consults `Backend::kv_bytes` (header-keyed, so it applies even on a fallback) |
@@ -378,6 +379,36 @@ A failed factor drops the entry from the running snapshot. Unmanaged `llama-serv
 **A confirmed entry is demoted, not restored.** `state.running` is cleared on every boot and each adopted snapshot is projected into an `external` row (`ExternalProcess::from_adopted`), because rebuilding a `ManagedModel` would mean re-attaching to a dead daemon's pipes — there is no way to resume log capture or the health monitor for a child this process never spawned. The consequences are deliberate: the row accepts `stop_external` and nothing else, it is **not** re-published on `/v1/models`, and `route::decide` cannot pick it, so the next proxy request for that model starts a new launch beside it. What does survive is the launch **name**, carried onto the row so `status` still renders `<model>@<name>` and `stop <name>` still reaches it — the one piece of the address a crash would otherwise take with it.
 
 **Nothing is re-launched at boot either — except what you ask for.** `daemon.preload:` (or a preset pinning `preload: true`) names the models that should be warm the moment the daemon is up, and `daemon::preload` starts them: each entry (a `list` reference, a `<model>@<preset>` address, or a launch file) goes through the normal `compose_and_spawn` with `LaunchOrigin::Manual`, so the admission gate prices it like any other launch and the idle sweep cannot unload it. Launches run sequentially in list order — two concurrent launches read the same free-memory sample and can both be admitted against memory only one fits in, which is what the gate exists to prevent — so the list doubles as a priority order. An entry that names nothing, or that does not fit, logs one line and is skipped: preload never blocks or fails the boot. A preset that pins `preload: true` has to be keyed to exactly one model, because a preloaded launch is manual intent and no sweep or make-room pass may ever take it back: an arch or wide-glob key would pin every model it matches and the boot would start them one after another until admission refused, so such a key is skipped with the count it scoped. Launch-file entries take `~` paths, expanded before the file is read. The daemon waits for the first discovery scan to populate the catalog before resolving references, since entries resolve the way CLI references do.
+
+### Prompt cache across an unload
+
+An unloaded llama.cpp chat no longer throws away the prompt it already read.
+`Backend::before_unload` and `Backend::after_launch_ready` are the two neutral
+no-op hooks it is done through — the first called on every stop path (`stop_model`,
+`stop_all`, the idle sweep, make-room, daemon exit), the second on the
+`Loading → Ready` transition — and llama.cpp is the only backend that implements
+either. On the way out a launch saves each Ready slot (`POST
+/slots/{id}?action=save`) into
+`<cache-dir>/prompt-cache/<model stem>-<8-hex-of-blake3-of-the-path>/slot-N.kv`;
+the next launch of that model file reads them back (`?action=restore`, oldest
+dump first, at most four) *before* the row reports Ready — a server that has
+already served a request has busy slots, and a restore into a busy slot fails,
+which is why the handback is not left to the first request. The matching is
+llama.cpp's, not ours: a dump is reused only for the prefix whose token sequence
+matches, so no session identity exists on our side and a conversation that
+repeats nothing new simply reprocesses. It is offered only where it can pay —
+chat launches, launches where `--fit` is not sizing memory (a kept dump changes
+the arithmetic `--fit` reads), and builds whose `--help` advertises
+`--slot-save-path` (`CAP_SLOT_SAVE`, read off the same one probe as
+`CAP_LOAD_MODE_DIALECT`); a build without it is launched with neither the flag
+nor the directory. Both calls are best-effort — a 10 s save window, a 60 s
+per-call ceiling, and a keep that fails is logged and the stop or the launch
+carries on. What it may occupy on disk is `backend.llamacpp.prompt_cache_max_mib`
+(default 8192 MiB, `0` off) and `backend.llamacpp.prompt_cache_max_age_secs`
+(default 3600 s, `0` no age limit), enforced at save time: expired dumps first,
+then whole model directories, oldest first. The numbers behind those defaults are
+in [`spikes/2026-10-21-slot-save-prompt-cache.md`](spikes/2026-10-21-slot-save-prompt-cache.md);
+user wording is in [`usage.md` § the residency paragraph](usage.md#llamastash-presets-model-ref).
 
 ## Daemon idle shutdown
 

@@ -545,6 +545,29 @@ backend:
     # Sources — CLI: (none) · Env: (none, config-only).
     map_anthropic_effort: true
 
+    # Disk budget, in MiB, that kept prompt caches may occupy — `0` turns the
+    # feature off (default: 8192). When llama.cpp stops a chat mid-conversation
+    # (the idle sweep, or making room for another model), the processed prompt is
+    # dumped through the engine's slot-save endpoint and handed back to that
+    # model's next launch, which skips re-reading it. There is no flag for it:
+    # a build without the engine's slot endpoints is never given any of this. A
+    # dump costs about 33 KB per prompt token, so this is the knob that decides
+    # how much conversation the feature may hold on to. Dumps land under
+    # `<cache-dir>/prompt-cache/`, one directory per model file, and are dropped
+    # oldest-first — past the age below first, then whole models until the tree
+    # fits again. Daemon shutdown and `stop --all` included.
+    #
+    # Sources — CLI: (none) · Env: (none, config-only).
+    prompt_cache_max_mib: 8192
+
+    # How long a kept prompt cache is worth reading back, in seconds; `0` keeps
+    # dumps until the disk budget needs them (default: 3600). A dump older than
+    # this is dropped rather than read back: the conversation it belongs to is
+    # not coming back.
+    #
+    # Sources — CLI: (none) · Env: (none, config-only).
+    prompt_cache_max_age_secs: 3600
+
   # ── Lemonade (NPU / multi-engine backend) [EXPERIMENTAL] ──
   #
   # EXPERIMENTAL: behaviour and these keys may change. A second backend

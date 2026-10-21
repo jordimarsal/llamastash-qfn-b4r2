@@ -17,9 +17,10 @@
 //!   launch's own preset override when it pins one and `proxy.idle_ttl_secs`
 //!   otherwise.
 //!
-//! The stop goes through the backend's own `stop` (5 s grace), the same path
-//! `stop_model` uses, so the supervisor and its `state.running` row are dropped
-//! with it.
+//! The stop goes through the backend's own `unload` (5 s grace), the same path
+//! the `model.stop` RPC uses, so the supervisor and its `state.running` row are
+//! dropped with it — and so that a backend with something to keep for this
+//! model's next launch is asked while its engine is still up.
 //!
 //! **Make-room.** When admission refuses a proxy auto-start, idle auto-started
 //! launches are unloaded least-recently-used first until the refused demand fits,
@@ -218,16 +219,18 @@ pub async fn sweep_once(state: &Arc<ProxyState>, default_ttl: Duration) {
   }
 }
 
-/// Stop one launch through its own backend — the path `stop_model` uses, so the
-/// supervisor and its `state.running` row go with it and a backend that
-/// overrides `stop` is dispatched rather than defaulted. For a delegated
-/// (multiplexer) row that `stop` is the umbrella-unload call, which is why the
-/// sweep and make-room need only one stop helper.
+/// Stop one launch through its own backend — the same `unload` the `model.stop`
+/// RPC uses, so the supervisor and its `state.running` row go with it and a
+/// backend that overrides either hook is dispatched rather than defaulted. For a
+/// delegated (multiplexer) row that hook is the umbrella-unload call, which is
+/// why the sweep and make-room need only one stop helper. Both sweep and
+/// make-room cut a conversation off mid-way, so both are the paths a backend
+/// that keeps a model's state across an unload is asked on.
 async fn stop_launch(ctx: &crate::daemon::context::MethodContext, launch_id: &LaunchId) {
   use crate::backend::Backend;
   let backend = crate::daemon::launch_service::backend_for_launch(ctx, launch_id).await;
   let _ = backend
-    .stop(ctx, launch_id, EVICT_STOP_GRACE.as_secs())
+    .unload(ctx, launch_id, EVICT_STOP_GRACE.as_secs())
     .await;
 }
 

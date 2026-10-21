@@ -194,9 +194,13 @@ async fn stop_model_handler(
   // Hand the launch to its owning backend and ask it to stop — the backend
   // decides *how* (SIGTERM a supervised child, or unload from its umbrella). The
   // caller resolves the owner (registry lookup by recorded backend id) but never
-  // branches on process-vs-umbrella lifecycle.
+  // branches on process-vs-umbrella lifecycle. `unload`, not `stop`: this is the
+  // path that interrupts a model a user may come back to, so a backend with
+  // something to keep for the next launch is asked first. `stop_all` keeps
+  // plain `stop` — a daemon that is exiting has no next launch to hand it back
+  // to, and a keep there costs shutdown time for nothing.
   let backend = crate::daemon::launch_service::backend_for_launch(ctx, &parsed.launch_id).await;
-  crate::backend::Backend::stop(&backend, ctx, &parsed.launch_id, parsed.grace_secs).await
+  crate::backend::Backend::unload(&backend, ctx, &parsed.launch_id, parsed.grace_secs).await
 }
 
 /// The `(owning backend, umbrella model name)` behind a delegated launch id, or
