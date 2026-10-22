@@ -156,6 +156,15 @@ impl PersistedState {
     Self::new(DaemonState::default(), None)
   }
 
+  /// The directory this store's `state.json` lives in, or `None` when the store
+  /// is in-memory. A daemon's other per-daemon runtime files belong beside it —
+  /// that is what makes them follow `--state-dir` / `LLAMASTASH_STATE_DIR` and
+  /// stay separate between two daemons, which `~/.…/llamastash` paths resolved
+  /// out of the process environment cannot promise.
+  pub fn dir(&self) -> Option<&std::path::Path> {
+    self.state_dir.as_deref()
+  }
+
   /// Snapshot — cheap clone of the inner state.
   pub async fn snapshot(&self) -> DaemonState {
     self.state.lock().await.clone()
