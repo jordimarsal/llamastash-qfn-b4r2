@@ -121,6 +121,29 @@ pub(crate) fn compose(params: &LaunchParams, allocated_port: u16) -> Vec<OsStrin
     knob_argv.push(sel.into());
   }
   argv.extend(knob_argv);
+  // Where the engine keeps a slot's KV checkpoint, if this launch is keeping one
+  // at all. Two conditions: the config wants a prompt cache carried across an
+  // unload, and this build has the endpoints that write to the path (a build
+  // predating `--slot-save-path` has nowhere for a save to land). Left alone
+  // when the caller already chose a path in `extras` — theirs is the one the
+  // engine will honour, and the save/restore hooks read it back off
+  // `launch_config` — or turned the slot surface off.
+  if let Some(dir) = params
+    .launch_config
+    .get(super::LLAMACPP_KNOB_SLOT_SAVE_DIR)
+    .filter(|_| {
+      params
+        .launch_config
+        .get(super::LLAMACPP_KNOB_SLOT_SAVE)
+        .map(String::as_str)
+        == Some("true")
+    })
+    .filter(|_| !super::extras_carry(&params.extras, "--slot-save-path"))
+    .filter(|_| !super::extras_carry(&params.extras, "--no-slots"))
+  {
+    argv.push("--slot-save-path".into());
+    argv.push(dir.into());
+  }
   // Defensive strip: refuse to pass loopback-breaking flags even if
   // an upstream validator was skipped. Last-occurrence semantics in
   // llama-server mean a single `--host 0.0.0.0` here would override
@@ -572,5 +595,83 @@ mod tests {
     assert!(p.knobs.str(crate::launch::knobs::kid("device")).is_none());
     let argv = strs(&compose(&p, 41100));
     assert!(!argv.iter().any(|a| *a == "--device"));
+  }
+
+  // ---- Prompt cache across an unload ----
+
+  /// What `seed_launch_knobs` decides and what the save/restore hooks read back
+  /// is this pair of keys; `compose` is where the decision becomes a flag.
+  fn keep_prompt_cache(p: &mut LaunchParams, dir: &str) {
+    p.launch_config.insert(
+      super::super::LLAMACPP_KNOB_SLOT_SAVE.to_string(),
+      "true".to_string(),
+    );
+    p.launch_config.insert(
+      super::super::LLAMACPP_KNOB_SLOT_SAVE_DIR.to_string(),
+      dir.to_string(),
+    );
+  }
+
+  /// The save endpoints exist on any `--slots` build, but without a path the
+  /// engine writes wherever its cwd happens to be — a file llamastash could not
+  /// find on the next launch. The flag is what makes the pair usable.
+  #[test]
+  fn compose_points_the_engine_at_the_directory_it_records() {
+    let mut p = base_params();
+    keep_prompt_cache(&mut p, "/state/prompt-cache");
+    let argv = strs(&compose(&p, 41100));
+    let i = argv.iter().position(|a| a == "--slot-save-path").unwrap();
+    assert_eq!(argv[i + 1], "/state/prompt-cache");
+  }
+
+  /// A launch with no directory recorded — started before this feature, or with
+  /// the switch off — gets no flag, so its argv is byte-for-byte what it was.
+  #[test]
+  fn compose_says_nothing_about_slot_save_when_nothing_is_recorded() {
+    let p = base_params();
+    let argv = strs(&compose(&p, 41100));
+    assert!(!argv.iter().any(|a| a.starts_with("--slot-save-path")));
+  }
+
+  /// A fork whose `--help` never advertised `--slot-save-path` gets no flag, even
+  /// though the config switch is on: an unknown argument would fail the launch.
+  #[test]
+  fn compose_omits_slot_save_for_a_build_without_the_endpoints() {
+    let mut p = base_params();
+    keep_prompt_cache(&mut p, "/state/prompt-cache");
+    p.launch_config.insert(
+      super::super::LLAMACPP_KNOB_SLOT_SAVE.to_string(),
+      "false".to_string(),
+    );
+    let argv = strs(&compose(&p, 41100));
+    assert!(!argv.iter().any(|a| a.starts_with("--slot-save-path")));
+  }
+
+  /// A caller who manages their own checkpoints gets their path, once. Emitting
+  /// ours too would make the last flag win and quietly move their files.
+  #[test]
+  fn compose_leaves_a_caller_supplied_path_to_the_caller() {
+    let mut p = base_params();
+    keep_prompt_cache(&mut p, "/state/prompt-cache");
+    p.extras = vec![
+      OsString::from("--slot-save-path"),
+      OsString::from("/home/me/slots"),
+    ];
+    let argv = strs(&compose(&p, 41100));
+    let count = argv.iter().filter(|a| *a == "--slot-save-path").count();
+    assert_eq!(count, 1, "{argv:?}");
+    let i = argv.iter().position(|a| a == "--slot-save-path").unwrap();
+    assert_eq!(argv[i + 1], "/home/me/slots");
+  }
+
+  /// `--no-slots` means no slot can hold a prompt, so there is nothing to save.
+  #[test]
+  fn compose_omits_slot_save_when_slots_are_off() {
+    let mut p = base_params();
+    keep_prompt_cache(&mut p, "/state/prompt-cache");
+    p.extras = vec![OsString::from("--no-slots")];
+    let argv = strs(&compose(&p, 41100));
+    assert!(argv.iter().any(|a| a == "--no-slots"));
+    assert!(!argv.iter().any(|a| a.starts_with("--slot-save-path")));
   }
 }

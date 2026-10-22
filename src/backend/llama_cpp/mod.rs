@@ -17,6 +17,7 @@ mod compose;
 mod effort;
 pub mod knobs;
 pub mod list_devices;
+mod prompt_cache;
 mod telemetry;
 
 use compose::compose;
@@ -49,6 +50,16 @@ pub const LLAMACPP_KNOB_FIT_CTX_FLOOR: &str = "fit_ctx_floor";
 pub const LLAMACPP_KNOB_LOAD_MODE_DIALECT: &str = "load_mode_dialect";
 /// The same fact as a [`caps`] probe key on `Server::caps`.
 pub const CAP_LOAD_MODE_DIALECT: &str = "load_mode_dialect";
+/// `launch_config` key carrying whether the resolved build can checkpoint a
+/// slot's KV state at all. Written by `seed_binary_caps` from the server
+/// catalog's [`CAP_SLOT_SAVE`], read by `compose`.
+pub const LLAMACPP_KNOB_SLOT_SAVE: &str = "slot_save";
+/// The same fact as a probe key on `Server::caps`.
+pub const CAP_SLOT_SAVE: &str = "slot_save";
+/// `launch_config` key carrying the directory a launch checkpoints its slot KV
+/// state into. Written by `seed_launch_knobs` from
+/// `backend.llamacpp.prompt_cache`, read by `compose`.
+pub const LLAMACPP_KNOB_SLOT_SAVE_DIR: &str = "slot_save_dir";
 
 /// The `fit_ctx_floor` launch knob parsed to `u32`, or `None` when unseeded /
 /// unparsable. Shared by the admission-floor and readiness-gate hooks.
@@ -57,6 +68,37 @@ fn fit_ctx_floor_knob(params: &LaunchParams) -> Option<u32> {
     .launch_config
     .get(LLAMACPP_KNOB_FIT_CTX_FLOOR)
     .and_then(|s| s.parse::<u32>().ok())
+}
+
+/// Whether a caller-supplied `extras` argv carries this flag head at all.
+pub(crate) fn extras_carry(extras: &[std::ffi::OsString], head: &str) -> bool {
+  let inline = format!("{head}=");
+  extras.iter().any(|arg| {
+    let text = arg.to_string_lossy();
+    text == head || text.starts_with(&*inline)
+  })
+}
+
+/// The value a caller-supplied `extras` argv carries for a flag head, in either
+/// spelling llama.cpp takes (`--flag value`, `--flag=value`), or `None`.
+///
+/// Used where a flag llamastash would otherwise emit is already the caller's
+/// decision: llama.cpp honours the last occurrence in argv, so emitting a second
+/// copy would silently override theirs.
+pub(crate) fn extras_value(extras: &[std::ffi::OsString], head: &str) -> Option<String> {
+  let inline = format!("{head}=");
+  extras.iter().enumerate().find_map(|(i, arg)| {
+    let text = arg.to_string_lossy();
+    if let Some(value) = text.strip_prefix(&*inline) {
+      return Some(value.to_string());
+    }
+    if text == head {
+      return extras
+        .get(i + 1)
+        .map(|value| value.to_string_lossy().into_owned());
+    }
+    None
+  })
 }
 
 /// Environment variables removed before spawning `llama-server`.
@@ -160,6 +202,19 @@ pub struct LlamaCppConfig {
   /// sends an effort value on every request would otherwise always win.
   #[serde(default = "default_true")]
   pub map_anthropic_effort: bool,
+  /// Hand a stopped launch's prompt cache to the engine and take it back on the
+  /// next launch, so an evicted conversation is reprocessed from where it stopped
+  /// instead of from token zero (`factory: true`). See
+  /// `crate::backend::llama_cpp::prompt_cache` for what is written, where, and
+  /// when.
+  #[serde(default = "default_true")]
+  pub prompt_cache: bool,
+  /// Ceiling in MiB on the whole checkpoint directory, oldest files dropped
+  /// first. A checkpoint is KV-sized — the spike's 100k-token window on a 1B
+  /// model was 3.02 GiB, about 32.8 KiB per token — so the default is a
+  /// gigabytes-scale budget, not an unbounded one. `0` keeps nothing.
+  #[serde(default = "default_prompt_cache_max_mb")]
+  pub prompt_cache_max_mb: u64,
 }
 
 fn default_true() -> bool {
@@ -170,6 +225,10 @@ fn default_fit_ctx_floor() -> u32 {
   crate::config::DEFAULT_FIT_CTX_FLOOR
 }
 
+fn default_prompt_cache_max_mb() -> u64 {
+  4096
+}
+
 impl Default for LlamaCppConfig {
   fn default() -> Self {
     Self {
@@ -178,11 +237,18 @@ impl Default for LlamaCppConfig {
       strict_fit: false,
       fit_ctx_floor: crate::config::DEFAULT_FIT_CTX_FLOOR,
       map_anthropic_effort: true,
+      prompt_cache: true,
+      prompt_cache_max_mb: default_prompt_cache_max_mb(),
     }
   }
 }
 
 impl LlamaCppConfig {
+  /// The checkpoint directory's ceiling as bytes, as the prune needs it.
+  pub fn prompt_cache_max_bytes(&self) -> u64 {
+    self.prompt_cache_max_mb.saturating_mul(1024 * 1024)
+  }
+
   /// The configured default (first) server binary, if any — the `config_path`
   /// input to the daemon's `llama-server` locator.
   pub fn primary_binary(&self) -> Option<PathBuf> {
@@ -375,18 +441,43 @@ impl Backend for LlamaCppBackend {
 
   fn probe_caps(&self, binary: &Path) -> std::collections::BTreeMap<String, String> {
     let mut caps = std::collections::BTreeMap::new();
+    // Both answers come out of one `--help` run on this binary.
+    let help = caps::help_text(binary);
+    let dialect = match &help {
+      Some(text) => caps::LoadModeDialect::from_help(text),
+      None => {
+        log::warn!("assuming the pre-`--load-mode` flags for {binary:?}");
+        caps::LoadModeDialect::Flags
+      }
+    };
     caps.insert(
       CAP_LOAD_MODE_DIALECT.to_string(),
-      caps::LoadModeDialect::probe(binary).label().to_string(),
+      dialect.label().to_string(),
+    );
+    caps.insert(
+      CAP_SLOT_SAVE.to_string(),
+      caps::checkpoints_slots_in_help(help.as_deref().unwrap_or_default()).to_string(),
     );
     caps
   }
 
   fn seed_binary_caps(&self, binary: &Path, servers: &[super::Server], params: &mut LaunchParams) {
-    let dialect = match servers.iter().find(|s| s.binary == binary) {
-      Some(server) => caps::LoadModeDialect::from_label(
-        server.caps.get(CAP_LOAD_MODE_DIALECT).map(String::as_str),
-      ),
+    let (dialect, slot_save) = match servers.iter().find(|s| s.binary == binary) {
+      Some(server) => {
+        let slot_save = match server.caps.get(CAP_SLOT_SAVE).map(String::as_str) {
+          Some(value) => value == "true",
+          // A row built without the probe (`doctor`'s config-only catalog) says
+          // nothing about the build. Ask the binary rather than reading silence
+          // as "no": the answer here decides whether a feature runs at all.
+          None => caps::checkpoints_slots(binary),
+        };
+        (
+          caps::LoadModeDialect::from_label(
+            server.caps.get(CAP_LOAD_MODE_DIALECT).map(String::as_str),
+          ),
+          slot_save,
+        )
+      }
       // The binary should always be a catalog row (`configured_servers` adds the
       // daemon's resolved default), so a miss means the catalog and the launch
       // disagree. Probe rather than assume: guessing wrong here emits a flag the
@@ -396,13 +487,19 @@ impl Backend for LlamaCppBackend {
           "{} is not in the server catalog; probing its flags directly",
           binary.display()
         );
-        caps::LoadModeDialect::probe(binary)
+        (
+          caps::LoadModeDialect::probe(binary),
+          caps::checkpoints_slots(binary),
+        )
       }
     };
     params.launch_config.insert(
       LLAMACPP_KNOB_LOAD_MODE_DIALECT.to_string(),
       dialect.label().to_string(),
     );
+    params
+      .launch_config
+      .insert(LLAMACPP_KNOB_SLOT_SAVE.to_string(), slot_save.to_string());
   }
 
   fn launch_priority(&self) -> i32 {
@@ -463,6 +560,65 @@ impl Backend for LlamaCppBackend {
       LLAMACPP_KNOB_FIT_CTX_FLOOR.to_string(),
       cfg.fit_ctx_floor.to_string(),
     );
+    // Whether to checkpoint slot KV state at all is a *config* question (the
+    // engine's capability is stamped by `seed_binary_caps`, and `compose` needs
+    // both). The bench parity escape hatch suppresses it for the same reason it
+    // suppresses `--jinja`: an extra flag in the argv would stop `start` being
+    // byte-identical to raw `llama-server` in the Suite-A overhead runs.
+    let keep = cfg.prompt_cache && !crate::launch::params::bench_disable_defaults_from_env();
+    // A caller who set their own `--slot-save-path` in `extras` is managing the
+    // checkpoints themselves; the directory key then names *their* path, so the
+    // save and restore go where the engine will actually write and `compose`
+    // emits no second flag.
+    let dir = match extras_value(&params.extras, "--slot-save-path") {
+      Some(path) => Some(path),
+      None if !keep => None,
+      None => {
+        // Otherwise the checkpoint lives beside the daemon's own runtime files,
+        // not under a home-directory path read out of the process environment:
+        // it belongs to *this* daemon, and two daemons must not read, restore,
+        // or prune each other's work.
+        ctx.state.dir().map(|state| {
+          prompt_cache::slot_dir_for_state(state)
+            .display()
+            .to_string()
+        })
+      }
+    };
+    match dir {
+      Some(dir) => {
+        // The engine validates the path while parsing its arguments, so the
+        // directory is made here, at the same moment the flag is decided. A
+        // launch that cannot make one runs without the feature rather than not
+        // at all.
+        match prompt_cache::prepare_slot_dir(Path::new(&dir)) {
+          Some(dir) => {
+            params.launch_config.insert(
+              LLAMACPP_KNOB_SLOT_SAVE_DIR.to_string(),
+              dir.display().to_string(),
+            );
+          }
+          None => {
+            params.launch_config.remove(LLAMACPP_KNOB_SLOT_SAVE_DIR);
+          }
+        }
+      }
+      None => {
+        params.launch_config.remove(LLAMACPP_KNOB_SLOT_SAVE_DIR);
+      }
+    }
+  }
+
+  async fn before_stop(
+    &self,
+    ctx: &MethodContext,
+    model: &crate::daemon::supervisor::ManagedModel,
+  ) {
+    prompt_cache::save_before_stop(ctx, model).await;
+  }
+
+  async fn after_ready(&self, model: &crate::daemon::supervisor::ManagedModel) {
+    prompt_cache::restore_after_ready(model).await;
   }
 
   fn admission_ctx_floor(&self, params: &LaunchParams) -> Option<u32> {

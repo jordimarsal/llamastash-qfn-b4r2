@@ -25,6 +25,11 @@
 //! - `--print-env <VAR>` (test-only, repeatable — print `env VAR=<value>` to
 //!   stdout at start, so a test can read the child's environment from its log)
 //! - `--print-argv` (test-only — print `argv <args…>` to stdout at start)
+//! - `--slot-save-path <PATH>` (real flag, same meaning: the directory
+//!   `POST /slots/{id}?action=save|restore` reads and writes; the fixture keeps
+//!   one slot's "resident prompt" in a process-global counter and moves it
+//!   through a file, which is the only thing llamastash relies on across a
+//!   restart)
 //! - `--list-devices` (one-shot, mirrors real `llama-server`: prints a
 //!   fake adapter table and exits *without* serving). The number of
 //!   adapters comes from the `FAKE_LLAMA_DEVICES` env var, default `0`
@@ -42,6 +47,8 @@
 //! can wait for that signal if they want.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -72,7 +79,21 @@ struct Args {
   /// a real llama-server after generation — the fixture the status
   /// draft-acceptance scan asserts against.
   spec_mtp: bool,
+  /// `--slot-save-path <PATH>`: where the slot endpoints write and read. Absent
+  /// means the endpoints answer the way a server without a path does — with an
+  /// error.
+  slot_save_path: Option<PathBuf>,
 }
+
+/// What the fixture's one slot "holds": the token count of a prompt it served.
+/// Real llama-server keeps the KV state of a processed prompt in the slot that
+/// served it; the fixture keeps a number instead, and the save/restore endpoints
+/// move that number through a file so a **later** process can report it — which
+/// is the exact contract keeping a prompt cache across an unload depends on.
+static RESIDENT: AtomicI64 = AtomicI64::new(0);
+
+/// The prompt a served chat completion is taken to have processed.
+const SLOT_PROMPT_TOKENS: i64 = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -130,6 +151,7 @@ fn parse_args() -> Args {
   let mut sigterm_exit_delay_ms = None;
   let mut print_env = Vec::new();
   let mut spec_mtp = false;
+  let mut slot_save_path: Option<PathBuf> = None;
   while let Some(arg) = args.next() {
     match arg.as_str() {
       "--host" => host = args.next().expect("--host needs value"),
@@ -142,6 +164,7 @@ fn parse_args() -> Args {
       "--embeddings" => mode = Mode::Embedding,
       "--reranking" => mode = Mode::Rerank,
       "--spec-type" => spec_mtp = args.next().as_deref() == Some("draft-mtp"),
+      "--slot-save-path" => slot_save_path = args.next().map(PathBuf::from),
       "--health-delay-ms" => {
         health_delay_ms = args.next().and_then(|v| v.parse().ok()).unwrap_or(0);
       }
@@ -168,6 +191,7 @@ fn parse_args() -> Args {
     sigterm_exit_delay_ms,
     print_env,
     spec_mtp,
+    slot_save_path,
   }
 }
 
@@ -200,6 +224,12 @@ async fn main() {
     } else {
       println!("-lm,   --load-mode MODE                 model loading mode (default: auto)");
     }
+    // Slot checkpoints are on for either flavour of this fixture: the legacy
+    // switch is about load flags, not about how old the build is otherwise.
+    println!("      --slots, --no-slots               enable / disable slots (default: enabled)");
+    println!(
+      "      --slot-save-path PATH             path to save slot kv cache (default: disabled)"
+    );
     return;
   }
 
@@ -330,6 +360,23 @@ async fn handle(
     br.read_exact(&mut body).await?;
   }
 
+  // The slot endpoints carry the slot id and the action in the URL
+  // (`POST /slots/2?action=save`), so they are matched by prefix ahead of the
+  // exact-path arms below.
+  if method == "POST" {
+    if let Some(rest) = path.strip_prefix("/slots/") {
+      let slot = rest.split('?').next().unwrap_or("").parse().unwrap_or(-1);
+      let action = path
+        .split("action=")
+        .nth(1)
+        .map(|tail| tail.split('&').next().unwrap_or(tail).to_string())
+        .unwrap_or_default();
+      handle_slot_action(&mut wr, &args, slot, &action, &body).await?;
+      let _ = wr.shutdown().await;
+      return Ok(());
+    }
+  }
+
   match (method.as_str(), path.as_str()) {
     // Stock llama-server serves its web UI at `/`; mirror that with a
     // tiny recognisable page so the proxy's `/ui/` forwarding tests can
@@ -394,7 +441,28 @@ async fn handle(
       )
       .await?;
     }
+    ("GET", "/slots") => {
+      // The shape real llama-server reports once a slot has held a prompt — the
+      // `n_prompt_tokens` field is what a caller reads to decide whether there
+      // is anything worth saving.
+      let body = serde_json::json!([{
+        "id": 0,
+        "n_ctx": args.ctx.or(args.fit_ctx).unwrap_or(4096),
+        "is_processing": false,
+        "id_task": -1,
+        "n_prompt_tokens": RESIDENT.load(Ordering::Relaxed),
+      }]);
+      write_response(
+        &mut wr,
+        200,
+        "application/json",
+        serde_json::to_vec(&body)?.as_slice(),
+      )
+      .await?;
+    }
     ("POST", "/v1/chat/completions") => {
+      // Serving a prompt is what puts one in a slot.
+      RESIDENT.store(SLOT_PROMPT_TOKENS, Ordering::Relaxed);
       // Test failure-injection knobs via query string:
       //   ?fail=400   → return a 400 with a JSON error body
       //   ?malformed-sse=1 → emit a bogus `data:` frame before the
@@ -566,6 +634,115 @@ async fn handle(
   }
   let _ = wr.shutdown().await;
   Ok(())
+}
+
+/// `POST /slots/{id}?action=save|restore` with a `{"filename": …}` body, reading
+/// and writing under `--slot-save-path` exactly as llama.cpp does. The file is
+/// plain text naming a token count: the point is not the bytes, it is that a
+/// process which does not exist yet can pick the state up again.
+async fn handle_slot_action<W>(
+  mut wr: &mut W,
+  args: &Args,
+  slot: i64,
+  action: &str,
+  body: &[u8],
+) -> std::io::Result<()>
+where
+  W: AsyncWriteExt + Unpin,
+{
+  let file_name = serde_json::from_slice::<serde_json::Value>(body)
+    .ok()
+    .and_then(|v| {
+      v.get("filename")
+        .and_then(|f| f.as_str())
+        .map(str::to_string)
+    })
+    .unwrap_or_default();
+  async fn reject<W>(wr: &mut W, status: u16, error: &str, details: &str) -> std::io::Result<()>
+  where
+    W: AsyncWriteExt + Unpin,
+  {
+    let body = serde_json::json!({ "error": error, "details": details });
+    write_response(
+      wr,
+      status,
+      "application/json",
+      serde_json::to_string(&body).unwrap().as_bytes(),
+    )
+    .await
+  }
+  let dir = match args.slot_save_path.as_ref() {
+    Some(dir) if !file_name.is_empty() => dir.clone(),
+    _ => {
+      return reject(
+        &mut wr,
+        400,
+        "No slot save path",
+        "--slot-save-path is not set",
+      )
+      .await
+    }
+  };
+  let path = dir.join(&file_name);
+  let tokens = RESIDENT.load(Ordering::Relaxed);
+  match action {
+    "save" => {
+      let written = format!("slot {slot} tokens {tokens}\n");
+      if let Err(e) =
+        std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, written.as_bytes()))
+      {
+        return reject(&mut wr, 500, &format!("failed to save slot: {e}"), "").await;
+      }
+      let body = serde_json::json!({
+        "id_slot": slot,
+        "filename": file_name,
+        "n_saved": tokens,
+        "n_written": written.len(),
+        "timings": { "save_ms": 0.5 },
+      });
+      write_response(
+        &mut wr,
+        200,
+        "application/json",
+        serde_json::to_string(&body).unwrap().as_bytes(),
+      )
+      .await
+    }
+    "restore" => match std::fs::read_to_string(&path) {
+      Ok(text) => {
+        let restored = text
+          .split("tokens ")
+          .nth(1)
+          .and_then(|tail| tail.trim().parse::<i64>().ok())
+          .unwrap_or(0);
+        RESIDENT.store(restored, Ordering::Relaxed);
+        let body = serde_json::json!({
+          "id_slot": slot,
+          "filename": file_name,
+          "n_restored": restored,
+          "n_read": text.len(),
+          "timings": { "restore_ms": 0.4 },
+        });
+        write_response(
+          &mut wr,
+          200,
+          "application/json",
+          serde_json::to_string(&body).unwrap().as_bytes(),
+        )
+        .await
+      }
+      Err(_) => {
+        reject(
+          &mut wr,
+          400,
+          "Unable to restore slot",
+          "No available space in KV cache or invalid slot save file",
+        )
+        .await
+      }
+    },
+    other => reject(&mut wr, 400, "Unknown action", other).await,
+  }
 }
 
 /// Cheap `body.model` extractor.

@@ -1511,6 +1511,13 @@ pub(crate) async fn stop_supervised(
     )
   })?;
   let stopped_port = model.port();
+  // Ask the engine to keep what this launch has computed before its child goes
+  // away — the one moment that state can outlive the process. Only a Ready
+  // launch has a conversation worth keeping, and only a backend that can keep it
+  // is asked.
+  if matches!(model.state().await, ManagedState::Ready) {
+    model.backend().before_stop(ctx, &model).await;
+  }
   let final_state = model.stop(Duration::from_secs(grace_secs)).await;
   ctx.supervisors.remove(launch_id).await;
   drop_running_snapshots(ctx, &[(launch_id.clone(), stopped_port)]).await;

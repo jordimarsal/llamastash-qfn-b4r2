@@ -1002,6 +1002,28 @@ pub trait Backend {
   ) -> Result<serde_json::Value, crate::ipc::protocol::ErrorObject> {
     crate::daemon::launch_service::stop_supervised(ctx, launch_id, grace_secs).await
   }
+
+  /// Last chance to keep anything a supervised launch has computed, called before
+  /// its child is signalled — the one moment a process-per-model launch's
+  /// engine-side state can outlive it. Called from
+  /// `stop_supervised` (in `crate::daemon::launch_service`), so it
+  /// covers every stop: `stop_model`, `make_room`, the idle sweep, shutdown.
+  /// Default: nothing. A backend that uses it must return promptly — the caller is
+  /// already waiting for a stop, and an eviction a request is waiting on pays for
+  /// whatever this takes.
+  async fn before_stop(
+    &self,
+    _ctx: &MethodContext,
+    _model: &crate::daemon::supervisor::ManagedModel,
+  ) {
+  }
+
+  /// Called once, after a launch's endpoint answers and **before** it is declared
+  /// `Ready` — so a model that can take back state it kept from an earlier launch
+  /// has it in place before the first request arrives. Called from the
+  /// supervisor's readiness probe, the one point every process-per-model launch
+  /// passes through. Default: nothing.
+  async fn after_ready(&self, _model: &crate::daemon::supervisor::ManagedModel) {}
 }
 
 // ============================================================================
@@ -1421,6 +1443,18 @@ impl Backend for Backends {
     grace_secs: u64,
   ) -> Result<serde_json::Value, crate::ipc::protocol::ErrorObject> {
     for_each_backend!(self, b => b.stop(ctx, launch_id, grace_secs).await)
+  }
+
+  async fn before_stop(
+    &self,
+    ctx: &MethodContext,
+    model: &crate::daemon::supervisor::ManagedModel,
+  ) {
+    for_each_backend!(self, b => b.before_stop(ctx, model).await)
+  }
+
+  async fn after_ready(&self, model: &crate::daemon::supervisor::ManagedModel) {
+    for_each_backend!(self, b => b.after_ready(model).await)
   }
 }
 

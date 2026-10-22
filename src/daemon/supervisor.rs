@@ -675,6 +675,12 @@ pub async fn spawn(input: ManagedSpawn) -> Result<ManagedModel, SpawnError> {
           }
         }
         *probe_model.inner.actuals.write().await = actuals;
+        // Give the engine's own state back before the launch is routable: a
+        // model that can resume a stopped launch's prompt cache does it here, so
+        // the first request after a reload is not the one that pays for the
+        // reload. No-op for a backend that cannot. Bounded by the backend's own
+        // budget, not by the readiness probe's, which has already succeeded.
+        probe_backend.after_ready(&probe_model).await;
         let secs = SystemTime::now()
           .duration_since(UNIX_EPOCH)
           .map(|d| d.as_secs())

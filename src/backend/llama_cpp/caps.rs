@@ -34,6 +34,50 @@ pub enum LoadModeDialect {
   Flags,
 }
 
+/// Ask one binary what its own server CLI accepts. Every fact below is read
+/// out of this one text, so a launch pays one subprocess per binary, not one
+/// per question.
+///
+/// `None` when the binary will not answer; callers pick their own safe
+/// fallback and say which one, since what is safe differs by question.
+pub fn help_text(binary: &Path) -> Option<String> {
+  let mut cmd = Command::new(binary);
+  // The unified app takes server flags behind `serve`; `llama --help` prints
+  // the dispatcher's own help, which lists no server flags at all.
+  cmd.args(super::serve_prefix(binary));
+  cmd.arg("--help");
+  match crate::util::process::run_with_drain_and_timeout(cmd, HELP_TIMEOUT) {
+    // Some builds print help on stderr, some on stdout; read both rather than
+    // depending on which.
+    Ok(out) => Some(format!(
+      "{}{}",
+      String::from_utf8_lossy(&out.stdout),
+      String::from_utf8_lossy(&out.stderr)
+    )),
+    Err(e) => {
+      log::warn!("`{} --help` failed: {e:?}", binary.display());
+      None
+    }
+  }
+}
+
+/// Whether this build can checkpoint a slot's KV state at all.
+///
+/// Keyed on `--slot-save-path`, the flag that gives the `/slots?action=save`
+/// endpoint a directory to write into: a build that predates it has nowhere for
+/// a checkpoint to land, so the feature stays off instead of sending requests
+/// the engine would answer with an error.
+pub fn checkpoints_slots_in_help(help: &str) -> bool {
+  help.contains("--slot-save-path")
+}
+
+/// [`checkpoints_slots_in_help`] against a binary. A binary that will not print
+/// its help is read as not supporting it: the feature is an optimization, and
+/// guessing wrong on an unprobeable build would spend a launch finding out.
+pub fn checkpoints_slots(binary: &Path) -> bool {
+  help_text(binary).is_some_and(|help| checkpoints_slots_in_help(&help))
+}
+
 impl LoadModeDialect {
   /// Read one binary's `--help` and decide which spelling it takes.
   ///
@@ -42,25 +86,11 @@ impl LoadModeDialect {
   /// itself will reject the argv with a message naming the flag. Guessing
   /// `Enum` there would turn a clear rejection into a confusing one.
   pub fn probe(binary: &Path) -> Self {
-    let mut cmd = Command::new(binary);
-    // The unified app takes server flags behind `serve`; `llama --help` prints
-    // the dispatcher's own help, which lists no server flags at all.
-    cmd.args(super::serve_prefix(binary));
-    cmd.arg("--help");
-    match crate::util::process::run_with_drain_and_timeout(cmd, HELP_TIMEOUT) {
-      Ok(out) => {
-        // Some builds print help on stderr, some on stdout; read both rather
-        // than depending on which.
-        let text = format!(
-          "{}{}",
-          String::from_utf8_lossy(&out.stdout),
-          String::from_utf8_lossy(&out.stderr)
-        );
-        Self::from_help(&text)
-      }
-      Err(e) => {
+    match help_text(binary) {
+      Some(text) => Self::from_help(&text),
+      None => {
         log::warn!(
-          "`{} --help` failed: {e:?}; assuming the pre-`--load-mode` flags",
+          "assuming the pre-`--load-mode` flags for {}",
           binary.display()
         );
         Self::Flags
@@ -133,6 +163,22 @@ mod tests {
   fn an_unreadable_help_falls_back_to_the_flags() {
     assert_eq!(LoadModeDialect::from_help(""), LoadModeDialect::Flags);
     assert_eq!(LoadModeDialect::default(), LoadModeDialect::Flags);
+  }
+
+  /// Captured from `llama-server --help` on build 11580 (commit `4413a1924`).
+  const SLOT_HELP: &str = "\
+--slots, --no-slots                     expose slots monitoring endpoint (default: enabled)
+--slot-save-path PATH                   path to save slot kv cache (default: disabled)
+";
+
+  /// The pre-checkpoint capture above, plus the real one: a build that
+  /// advertises the flag is asked, a build that does not is left alone.
+  #[test]
+  fn a_build_advertising_slot_save_can_checkpoint() {
+    assert!(checkpoints_slots_in_help(SLOT_HELP));
+    assert!(!checkpoints_slots_in_help(NEW_HELP));
+    assert!(!checkpoints_slots_in_help(OLD_HELP));
+    assert!(!checkpoints_slots_in_help(""));
   }
 
   #[test]
