@@ -171,7 +171,7 @@ pub struct LlamaCppConfig {
   /// by every model the daemon has kept state for. Factory
   /// [`DEFAULT_PROMPT_CACHE_MAX_MIB`]. `0` turns the feature off: no
   /// `--slot-save-path`, no save, no restore. See
-  /// [`prompt_cache`](prompt_cache) for what is written and when.
+  /// `prompt_cache` documents what is written and when.
   #[serde(default = "default_prompt_cache_max_mib")]
   pub prompt_cache_max_mib: u32,
   /// How long kept state may sit before it is dropped rather than read back —
@@ -1083,13 +1083,13 @@ mod tests {
       cfg.prompt_cache_max_age_secs,
       prompt_cache::DEFAULT_PROMPT_CACHE_MAX_AGE_SECS
     );
-    let cfg: LlamaCppConfig = serde_json::from_value(serde_json::json!({
+    let overridden: LlamaCppConfig = serde_json::from_value(serde_json::json!({
       "prompt_cache_max_mib": 512,
       "prompt_cache_max_age_secs": 0,
     }))
     .expect("both keys are authorable in config.yaml");
-    assert_eq!(cfg.prompt_cache_max_mib, 512);
-    assert_eq!(cfg.prompt_cache_max_age_secs, 0);
+    assert_eq!(overridden.prompt_cache_max_mib, 512);
+    assert_eq!(overridden.prompt_cache_max_age_secs, 0);
   }
 
   // ---- Parity: prepare_launch argv == compose() byte-for-byte ----

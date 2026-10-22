@@ -541,8 +541,8 @@ async fn exchange(port: u16, head: &str, body: Option<&str>) -> Result<Value, St
   let outcome = tokio::time::timeout(ACTION_TIMEOUT, fut)
     .await
     .map_err(|_| String::from("slot action timed out"))?;
-  let (status, body) = outcome.map_err(|e| format!("slot action failed: {e}"))?;
-  let parsed: Value = serde_json::from_slice(&body)
+  let (status, resp) = outcome.map_err(|e| format!("slot action failed: {e}"))?;
+  let parsed: Value = serde_json::from_slice(&resp)
     .map_err(|e| format!("unreadable response from the slot endpoint: {e}"))?;
   if !(200..300).contains(&status) {
     let message = parsed
@@ -804,7 +804,7 @@ mod tests {
     write_dump(
       &models.join("model-recent"),
       1,
-      1 * 1024 * 1024,
+      1024 * 1024,
       Duration::from_secs(60),
     );
     let policy = Policy {
