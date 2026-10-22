@@ -428,7 +428,8 @@ Plans and item details: [`docs/plans/2026-10-05-001-feat-r14-batches-plan.md`](d
 
 ### Batch 4: faster reloads ([plan](docs/plans/2026-10-05-001-feat-r14-batches-plan.md#batch-4-faster-reloads))
 
-- [ ] Keep a model's prompt cache across an unload
+- [x] ~~Keep a model's prompt cache across an unload~~ — done: llama.cpp writes the slot's processed prompt to disk on its way out of every stop path, and the model's next launch is handed it back before its first request; `backend.llamacpp.prompt_cache_max_mib` and `prompt_cache_max_age_secs` cap what it may keep and for how long. Numbers in `docs/spikes/2026-10-21-slot-save-prompt-cache.md`, behavior in `docs/architecture.md` § Prompt cache across an unload.
+- [ ] Prompt cache, next cut: a per-model disk budget, and how a kept dump behaves on a multi-slot server. The tree is shared by every model on the machine, so a chatty small model can crowd a large one out of it, and every measurement behind the feature was made against a single-slot `llama-server`.
 - [ ] Warm the page cache before a load (`llamastash warm <model>`)
 
 ### Batch 5: CLI setup commands ([plan](docs/plans/2026-10-05-001-feat-r14-batches-plan.md#batch-5-cli-setup-commands))

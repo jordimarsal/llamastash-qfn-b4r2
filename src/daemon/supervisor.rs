@@ -680,6 +680,12 @@ pub async fn spawn(input: ManagedSpawn) -> Result<ManagedModel, SpawnError> {
           .map(|d| d.as_secs())
           .unwrap_or_default();
         *probe_model.inner.ready_at.write().await = Some(secs);
+        // Ready is also the point a backend gets handed its launch back for the
+        // first request, which is why a backend that kept state across an unload
+        // restores it *before* the transition: a model that is already routing
+        // traffic is a model whose slots are busy, and a restore into a busy slot
+        // is a coin flip. A backend with nothing to hand back returns at once.
+        crate::backend::Backend::after_launch_ready(&probe_backend, &probe_model).await;
         probe_model.transition(ManagedState::Ready).await;
       }
       ProbeOutcome::Timeout { last_status } => {

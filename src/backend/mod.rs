@@ -1002,6 +1002,43 @@ pub trait Backend {
   ) -> Result<serde_json::Value, crate::ipc::protocol::ErrorObject> {
     crate::daemon::launch_service::stop_supervised(ctx, launch_id, grace_secs).await
   }
+
+  /// Take a launch this backend owns out of memory. Default:
+  /// [`stop`](Backend::stop) — for a backend whose launches carry nothing worth
+  /// keeping, an unload *is* a stop and it is asked to do exactly that.
+  ///
+  /// A backend overrides this when its engine holds state the model's **next**
+  /// launch would pay to get back — a processed prompt, say — and can only write
+  /// it out while the engine is still alive. It returns what `stop` returns; a
+  /// keep that fails is the engine's problem to report, not a reason to leave a
+  /// request waiting for a process that is ready to exit. The callers are the
+  /// paths that interrupt a model a user may come back to: the `model.stop` RPC
+  /// and the proxy's idle sweep and make-room passes. `stop_all` and daemon
+  /// shutdown stay on `stop` — a daemon that is exiting has no next launch to
+  /// hand anything back to.
+  /// [`after_launch_ready`](Backend::after_launch_ready) is the half that hands
+  /// it back.
+  async fn unload(
+    &self,
+    ctx: &MethodContext,
+    launch_id: &crate::daemon::registry::LaunchId,
+    grace_secs: u64,
+  ) -> Result<serde_json::Value, crate::ipc::protocol::ErrorObject> {
+    self.stop(ctx, launch_id, grace_secs).await
+  }
+
+  /// A launch this backend owns has reached Ready. Default: nothing.
+  ///
+  /// The counterpart of [`Self::unload`]: a backend that wrote something out on
+  /// the way out of an earlier launch reads it back here, before this one can
+  /// serve its first request. It carries no dispatch context because everything
+  /// needed to hand a backend's own state back is on the launch's params.
+  ///
+  /// A backend implementing either hook says nothing about which models are
+  /// worth keeping — that decision is made once, where the launch is composed
+  /// ([`seed_launch_knobs`](Backend::seed_launch_knobs)), and a launch that was
+  /// told to keep nothing reaches both hooks with nothing to do.
+  async fn after_launch_ready(&self, _model: &crate::daemon::supervisor::ManagedModel) {}
 }
 
 // ============================================================================
@@ -1421,6 +1458,19 @@ impl Backend for Backends {
     grace_secs: u64,
   ) -> Result<serde_json::Value, crate::ipc::protocol::ErrorObject> {
     for_each_backend!(self, b => b.stop(ctx, launch_id, grace_secs).await)
+  }
+
+  async fn unload(
+    &self,
+    ctx: &MethodContext,
+    launch_id: &crate::daemon::registry::LaunchId,
+    grace_secs: u64,
+  ) -> Result<serde_json::Value, crate::ipc::protocol::ErrorObject> {
+    for_each_backend!(self, b => b.unload(ctx, launch_id, grace_secs).await)
+  }
+
+  async fn after_launch_ready(&self, model: &crate::daemon::supervisor::ManagedModel) {
+    for_each_backend!(self, b => b.after_launch_ready(model).await)
   }
 }
 
