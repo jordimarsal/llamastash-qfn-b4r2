@@ -248,7 +248,7 @@ windows-sys = { version = "0.61", features = [
 # pull in bzip2 / time / aes; we only need DEFLATE so the dep stays
 # small. Linux/macOS binary size is unchanged since this is
 # Windows-only.
-zip = { version = "5", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 # Idiomatic Win32 COM bindings — only used for the DXGI-based GPU
 # probe in `src/gpu/dxgi.rs`, which fills the Windows AMD detection
 # gap (rocm-smi is Linux-only) and also covers Intel + the rare
