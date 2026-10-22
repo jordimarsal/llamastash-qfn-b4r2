@@ -21,6 +21,33 @@ use std::time::Duration;
 /// hangs rather than prints. Matches the `--list-devices` probe.
 const HELP_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// One binary's answer to `--help`, stdout and stderr together — some builds
+/// print help on one, some on the other.
+///
+/// `--help` is a local, non-loading call, and every capability question about a
+/// build is answered from this one read: same shape as
+/// [`super::list_devices::probe`], one bounded subprocess per binary at boot.
+/// `None` means the binary would not answer; the caller decides what a build's
+/// silence means for each flag.
+pub fn help_text(binary: &Path) -> Option<String> {
+  let mut cmd = Command::new(binary);
+  // The unified app takes server flags behind `serve`; `llama --help` prints
+  // the dispatcher's own help, which lists no server flags at all.
+  cmd.args(super::serve_prefix(binary));
+  cmd.arg("--help");
+  match crate::util::process::run_with_drain_and_timeout(cmd, HELP_TIMEOUT) {
+    Ok(out) => Some(format!(
+      "{}{}",
+      String::from_utf8_lossy(&out.stdout),
+      String::from_utf8_lossy(&out.stderr)
+    )),
+    Err(e) => {
+      log::warn!("`{} --help` gave no answer: {e:?}", binary.display());
+      None
+    }
+  }
+}
+
 /// How a build spells "how should the model be loaded".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum LoadModeDialect {
@@ -35,42 +62,12 @@ pub enum LoadModeDialect {
 }
 
 impl LoadModeDialect {
-  /// Read one binary's `--help` and decide which spelling it takes.
-  ///
-  /// Keyed on the literal `--load-mode`, which is what the new dialect is; a
-  /// build advertising neither is left on [`Self::Flags`], where the engine
-  /// itself will reject the argv with a message naming the flag. Guessing
-  /// `Enum` there would turn a clear rejection into a confusing one.
-  pub fn probe(binary: &Path) -> Self {
-    let mut cmd = Command::new(binary);
-    // The unified app takes server flags behind `serve`; `llama --help` prints
-    // the dispatcher's own help, which lists no server flags at all.
-    cmd.args(super::serve_prefix(binary));
-    cmd.arg("--help");
-    match crate::util::process::run_with_drain_and_timeout(cmd, HELP_TIMEOUT) {
-      Ok(out) => {
-        // Some builds print help on stderr, some on stdout; read both rather
-        // than depending on which.
-        let text = format!(
-          "{}{}",
-          String::from_utf8_lossy(&out.stdout),
-          String::from_utf8_lossy(&out.stderr)
-        );
-        Self::from_help(&text)
-      }
-      Err(e) => {
-        log::warn!(
-          "`{} --help` failed: {e:?}; assuming the pre-`--load-mode` flags",
-          binary.display()
-        );
-        Self::Flags
-      }
-    }
-  }
-
-  /// The parse, split out so tests drive it with captured help text instead of
-  /// a binary.
+  /// Decide which spelling a build takes from its `--help` text.
   pub fn from_help(help: &str) -> Self {
+    // Keyed on the literal `--load-mode`, which is what the new dialect is; a
+    // build advertising neither is left on [`Self::Flags`], where the engine
+    // itself will reject the argv with a message naming the flag. Guessing
+    // `Enum` there would turn a clear rejection into a confusing one.
     if help.contains("--load-mode") {
       Self::Enum
     } else {

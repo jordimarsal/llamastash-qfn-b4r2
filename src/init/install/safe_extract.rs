@@ -422,6 +422,14 @@ pub fn safe_extract_zip<R: Read + std::io::Seek>(
     let mut entry = archive
       .by_index(i)
       .map_err(|e| InstallError::Io(format!("zip entry {i}: {e}")))?;
+    // zip 9 surfaces the entry name as a fallible lookup on Windows (the
+    // legacy CP437/OEM encoding flag) and as plain UTF-8 on Unix.
+    #[cfg(windows)]
+    let raw_name = entry
+      .name()
+      .map(|s| s.to_string())
+      .map_err(|e| InstallError::Io(format!("zip entry name: {e}")))?;
+    #[cfg(not(windows))]
     let raw_name = entry.name().to_string();
     // `zip` exposes a sanitized `enclosed_name()` that already rejects
     // absolute paths, `..` traversal, and Windows drive prefixes — but

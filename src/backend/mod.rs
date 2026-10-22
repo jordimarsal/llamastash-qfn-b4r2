@@ -1000,7 +1000,41 @@ pub trait Backend {
     launch_id: &crate::daemon::registry::LaunchId,
     grace_secs: u64,
   ) -> Result<serde_json::Value, crate::ipc::protocol::ErrorObject> {
+    // Ask first, then stop: an engine that can keep a launch's reusable state
+    // has to be asked while it is still answering. Backends that cannot keep
+    // anything are not asked at all — the default below is a no-op.
+    self.save_prompt_cache(ctx, launch_id).await;
     crate::daemon::launch_service::stop_supervised(ctx, launch_id, grace_secs).await
+  }
+
+  /// Write down whatever this launch's engine could reuse, before a stop on
+  /// purpose takes the launch away.
+  ///
+  /// The idle sweep, make-room and `stop` all end in [`Self::stop`], so this is
+  /// the one point where a "we are unloading this model because it is idle / to
+  /// make room" decision can be undone later. What is kept, and how it is
+  /// matched back to a returning model, is the backend's own business: a backend
+  /// whose engine has no such capability leaves this untouched, and the default
+  /// costs it nothing.
+  async fn save_prompt_cache(
+    &self,
+    _ctx: &MethodContext,
+    _launch_id: &crate::daemon::registry::LaunchId,
+  ) {
+  }
+
+  /// Give a launch back what was kept when this model was last unloaded.
+  ///
+  /// Called once for a launch the proxy started on its own, after it is Ready
+  /// and before its first request is forwarded — which is the request that would
+  /// otherwise reprocess the whole conversation. A launch someone started
+  /// deliberately (`llamastash start`, a preload) is not asked: nothing was kept
+  /// for a model that was never unloaded.
+  async fn restore_prompt_cache(
+    &self,
+    _ctx: &MethodContext,
+    _launch_id: &crate::daemon::registry::LaunchId,
+  ) {
   }
 }
 
@@ -1421,6 +1455,22 @@ impl Backend for Backends {
     grace_secs: u64,
   ) -> Result<serde_json::Value, crate::ipc::protocol::ErrorObject> {
     for_each_backend!(self, b => b.stop(ctx, launch_id, grace_secs).await)
+  }
+
+  async fn save_prompt_cache(
+    &self,
+    ctx: &MethodContext,
+    launch_id: &crate::daemon::registry::LaunchId,
+  ) {
+    for_each_backend!(self, b => b.save_prompt_cache(ctx, launch_id).await)
+  }
+
+  async fn restore_prompt_cache(
+    &self,
+    ctx: &MethodContext,
+    launch_id: &crate::daemon::registry::LaunchId,
+  ) {
+    for_each_backend!(self, b => b.restore_prompt_cache(ctx, launch_id).await)
   }
 }
 

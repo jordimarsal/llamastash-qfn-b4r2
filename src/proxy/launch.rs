@@ -285,7 +285,21 @@ async fn drive_launch_as_leader(
     log::warn!("proxy auto-start: {w}");
   }
 
-  await_ready(state, &started.model).await
+  let outcome = await_ready(state, &started.model).await;
+  // A model the proxy unloaded on purpose kept its prompt cache on the way out
+  // (`crate::backend::llama_cpp::prompt_cache`). This is the moment to hand it
+  // back: the launch is serving, and the request that started it is the one that
+  // would otherwise reprocess the whole conversation. A launch the proxy merely
+  // attached to is not asked — it is already serving.
+  if matches!(outcome, LaunchOutcome::Ready { .. }) {
+    use crate::backend::Backend;
+    let backend =
+      crate::daemon::launch_service::backend_for_launch(&state.ctx, &started.launch_id).await;
+    backend
+      .restore_prompt_cache(&state.ctx, &started.launch_id)
+      .await;
+  }
+  outcome
 }
 
 /// A supervisor already serving `model_id`'s file that this request can
