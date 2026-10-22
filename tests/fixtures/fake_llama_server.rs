@@ -215,7 +215,9 @@ async fn main() {
     // Opt-in, so a test that does not care about prompt state keeps the argv
     // and the capability answer it has always had.
     if std::env::var("FAKE_LLAMA_SLOT_SAVE").as_deref() == Ok("1") {
-      println!("      --slot-save-path PATH          path for saving slot contexts (default: none)");
+      println!(
+        "      --slot-save-path PATH          path for saving slot contexts (default: none)"
+      );
     }
     return;
   }
@@ -456,7 +458,11 @@ async fn handle(
       let req_text = std::str::from_utf8(&body).unwrap_or("");
       let filename = serde_json::from_str::<serde_json::Value>(req_text)
         .ok()
-        .and_then(|v| v.get("filename").and_then(|f| f.as_str()).map(str::to_string));
+        .and_then(|v| {
+          v.get("filename")
+            .and_then(|f| f.as_str())
+            .map(str::to_string)
+        });
       let _ = id_part;
       let (status, body) = slot_request(&args, &slot, action, filename.as_deref());
       write_response(&mut wr, status, "application/json", body.as_bytes()).await?;

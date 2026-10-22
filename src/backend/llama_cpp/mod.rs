@@ -55,8 +55,8 @@ pub const CAP_LOAD_MODE_DIALECT: &str = "load_mode_dialect";
 /// the directory the daemon would save to, and the one this launch was actually
 /// given (absent when the build has no `--slot-save-path`, when
 /// `backend.llamacpp.keep_prompt_cache` is off, or when `extras` owns the
-/// flag). Planned by [`prompt_cache::plan_save_dir`], confirmed by
-/// [`prompt_cache::enable_for_launch`] once the build has answered, read by
+/// flag). Planned by `prompt_cache::plan_save_dir`, confirmed by
+/// `prompt_cache::enable_for_launch` once the build has answered, read by
 /// `compose` and by the save / restore calls. Not user-settable.
 pub const LLAMACPP_KNOB_PROMPT_CACHE_DIR: &str = "prompt_cache_dir";
 pub const LLAMACPP_KNOB_SLOT_SAVE_PATH: &str = "slot_save_path";
@@ -451,9 +451,8 @@ impl Backend for LlamaCppBackend {
         self.probe_caps(binary)
       }
     };
-    let dialect = caps::LoadModeDialect::from_label(
-      caps.get(CAP_LOAD_MODE_DIALECT).map(String::as_str),
-    );
+    let dialect =
+      caps::LoadModeDialect::from_label(caps.get(CAP_LOAD_MODE_DIALECT).map(String::as_str));
     params.launch_config.insert(
       LLAMACPP_KNOB_LOAD_MODE_DIALECT.to_string(),
       dialect.label().to_string(),

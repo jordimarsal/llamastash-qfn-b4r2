@@ -31,9 +31,7 @@ use crate::daemon::context::MethodContext;
 use crate::daemon::registry::LaunchId;
 use crate::launch::params::LaunchParams;
 
-use super::{
-  LlamaCppConfig, LLAMACPP_KNOB_PROMPT_CACHE_DIR, LLAMACPP_KNOB_SLOT_SAVE_PATH,
-};
+use super::{LlamaCppConfig, LLAMACPP_KNOB_PROMPT_CACHE_DIR, LLAMACPP_KNOB_SLOT_SAVE_PATH};
 
 /// The flag the save directory is passed with. A user who puts this in a
 /// preset's `extras` owns it — see [`plan_save_dir`].
@@ -202,7 +200,10 @@ fn read_entry(path: &Path) -> Option<Entry> {
       None
     }
     Err(e) => {
-      log::debug!("prompt cache: {} is unreadable ({e}); dropped", path.display());
+      log::debug!(
+        "prompt cache: {} is unreadable ({e}); dropped",
+        path.display()
+      );
       None
     }
   }
@@ -362,7 +363,10 @@ pub(super) async fn save_before_stop(ctx: &MethodContext, launch_id: &LaunchId) 
     .filter(|s| !s.is_processing && s.n_prompt_tokens > 0)
     .collect();
   if warm.is_empty() {
-    log::debug!("prompt cache: {} has no idle slot with a prompt", launch_id.as_str());
+    log::debug!(
+      "prompt cache: {} has no idle slot with a prompt",
+      launch_id.as_str()
+    );
     return;
   }
 
@@ -374,7 +378,11 @@ pub(super) async fn save_before_stop(ctx: &MethodContext, launch_id: &LaunchId) 
   for slot in read_entry(&pending_path(&dir, &key))
     .into_iter()
     .flat_map(|e| e.slots)
-    .chain(read_entry(&consumed_path(&dir, &key)).into_iter().flat_map(|e| e.slots))
+    .chain(
+      read_entry(&consumed_path(&dir, &key))
+        .into_iter()
+        .flat_map(|e| e.slots),
+    )
   {
     let _ = std::fs::remove_file(dir.join(&slot.file));
   }
@@ -406,7 +414,7 @@ pub(super) async fn save_before_stop(ctx: &MethodContext, launch_id: &LaunchId) 
             ack
               .get("n_written")
               .and_then(serde_json::Value::as_u64)
-              .ok_or_else(|| std::io::Error::last_os_error())
+              .ok_or_else(std::io::Error::last_os_error)
           })
           .unwrap_or(0);
         log::info!(
@@ -487,7 +495,10 @@ pub(super) async fn restore_on_ready(ctx: &MethodContext, launch_id: &LaunchId) 
     Err(e) => {
       // A transport failure says nothing about the state; leave it for the next
       // attempt rather than spending it on a child that never answered.
-      log::warn!("prompt cache: /slots on {} unreadable ({e}); left for later", model.port());
+      log::warn!(
+        "prompt cache: /slots on {} unreadable ({e}); left for later",
+        model.port()
+      );
       let _ = std::fs::rename(&claimed, &pending);
       return;
     }
@@ -601,8 +612,14 @@ fn parse_slots(value: &serde_json::Value) -> Vec<SlotInfo> {
     .into_iter()
     .flatten()
     .map(|slot| SlotInfo {
-      id: slot.get("id").and_then(serde_json::Value::as_u64).unwrap_or(0) as u32,
-      n_ctx: slot.get("n_ctx").and_then(serde_json::Value::as_u64).unwrap_or(0),
+      id: slot
+        .get("id")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0) as u32,
+      n_ctx: slot
+        .get("n_ctx")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0),
       is_processing: slot
         .get("is_processing")
         .and_then(serde_json::Value::as_bool)
@@ -658,14 +675,18 @@ async fn request(
     .await
     .map_err(|_| "no reply in time".to_string())?
     .map_err(|e| format!("connection failed: {e}"))?;
-  let (status, body) = split_response(&raw)?;
+  let (status, resp) = split_response(&raw)?;
   if !(200..300).contains(&status) {
-    let detail = String::from_utf8_lossy(body);
+    let detail = String::from_utf8_lossy(resp);
     let detail = detail.trim();
-    let detail = if detail.len() > 240 { &detail[..240] } else { detail };
+    let detail = if detail.len() > 240 {
+      &detail[..240]
+    } else {
+      detail
+    };
     return Err(format!("HTTP {status}: {detail}"));
   }
-  serde_json::from_slice(body).map_err(|e| format!("unreadable reply: {e}"))
+  serde_json::from_slice(resp).map_err(|e| format!("unreadable reply: {e}"))
 }
 
 /// Status line and body from a raw HTTP response.
@@ -696,7 +717,9 @@ fn split_response(raw: &[u8]) -> Result<(u16, &[u8]), String> {
 /// fits. A state file no record names is a save interrupted by a crash, and it
 /// goes once it is older than the TTL too.
 fn prune(cfg: &LlamaCppConfig, dir: &Path) {
-  let Ok(reads) = std::fs::read_dir(dir) else { return };
+  let Ok(reads) = std::fs::read_dir(dir) else {
+    return;
+  };
   let now = now_unix();
   let mut records: Vec<(PathBuf, Entry)> = Vec::new();
   let mut named: Vec<String> = Vec::new();
@@ -829,7 +852,9 @@ mod tests {
 
   #[test]
   fn a_build_without_the_flag_gets_no_directory() {
-    assert!(!supported_in("       --mlock    force system to keep model in RAM"));
+    assert!(!supported_in(
+      "       --mlock    force system to keep model in RAM"
+    ));
     assert!(supported_in(
       "     --slot-save-path PATH    directory for slot state serialization"
     ));
@@ -852,14 +877,18 @@ mod tests {
   #[test]
   fn a_planned_directory_is_recorded_on_the_launch() {
     let mut p = params();
-    plan_save_dir(
-      &cfg(),
-      Some(Path::new("/cache/llamastash/logs")),
-      &mut p,
-    );
+    plan_save_dir(&cfg(), Some(Path::new("/cache/llamastash/logs")), &mut p);
+    let expected = Path::new("/cache/llamastash/logs")
+      .parent()
+      .expect("logs dir has a parent")
+      .join("prompt-cache")
+      .to_string_lossy()
+      .into_owned();
     assert_eq!(
-      p.launch_config.get(LLAMACPP_KNOB_PROMPT_CACHE_DIR).map(String::as_str),
-      Some("/cache/llamastash/prompt-cache")
+      p.launch_config
+        .get(LLAMACPP_KNOB_PROMPT_CACHE_DIR)
+        .map(String::as_str),
+      Some(expected.as_str())
     );
     // Planning alone never hands the engine a flag: only a confirmed build does.
     assert!(!p.launch_config.contains_key(LLAMACPP_KNOB_SLOT_SAVE_PATH));
@@ -875,11 +904,15 @@ mod tests {
 
     // `0` bytes is "keep nothing", and it is worth saying so without spawning a
     // save the budget would delete in the same breath.
-    let mut p = params();
+    let mut capped = params();
     let mut no_room = cfg();
     no_room.prompt_cache_max_bytes = 0;
-    plan_save_dir(&no_room, Some(Path::new("/cache/llamastash/logs")), &mut p);
-    assert!(p.launch_config.is_empty());
+    plan_save_dir(
+      &no_room,
+      Some(Path::new("/cache/llamastash/logs")),
+      &mut capped,
+    );
+    assert!(capped.launch_config.is_empty());
   }
 
   /// A caller who passes `--slot-save-path` themselves knows what they want; the
@@ -929,7 +962,9 @@ mod tests {
 
     enable_for_launch(&mut p, true);
     assert_eq!(
-      p.launch_config.get(LLAMACPP_KNOB_SLOT_SAVE_PATH).map(String::as_str),
+      p.launch_config
+        .get(LLAMACPP_KNOB_SLOT_SAVE_PATH)
+        .map(String::as_str),
       Some(planned.as_str())
     );
     assert!(
@@ -955,12 +990,17 @@ mod tests {
   fn model_key_is_a_name_llama_cpp_will_accept() {
     // `fs_validate_filename(name, allow_subdirs = false)`: no leading '-', no
     // `..`, and only `[A-Za-z0-9._-]`.
-    let id = model_id("/models/-Llama 3.2-1B (Q4_K_M).gguf", [0xab, 0xcd, 0xef, 0x01]);
+    let id = model_id(
+      "/models/-Llama 3.2-1B (Q4_K_M).gguf",
+      [0xab, 0xcd, 0xef, 0x01],
+    );
     let key = model_key(&id);
     assert!(!key.starts_with('-'));
     assert!(!key.contains(".."));
     assert!(!key.contains('/'));
-    assert!(key.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')));
+    assert!(key
+      .chars()
+      .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')));
     assert!(key.starts_with("Llama-3.2-1B--Q4_K_M-"), "{key}");
     assert!(key.ends_with("abcdef01"), "{key}");
     assert_eq!(model_key(&id), key, "the same model gets the same key");
@@ -990,8 +1030,12 @@ mod tests {
     let dir = Path::new("/d");
     let pending = pending_path(dir, "a-1234");
     let consumed = consumed_path(dir, "a-1234");
-    assert!(is_record_name(pending.file_name().unwrap().to_str().unwrap()));
-    assert!(is_record_name(consumed.file_name().unwrap().to_str().unwrap()));
+    assert!(is_record_name(
+      pending.file_name().unwrap().to_str().unwrap()
+    ));
+    assert!(is_record_name(
+      consumed.file_name().unwrap().to_str().unwrap()
+    ));
     assert!(!is_record_name("a-1234-slot-0-1700000000.bin"));
     assert_eq!(record_key(&pending), "a-1234");
     assert_eq!(record_key(&consumed), "a-1234");
@@ -1005,7 +1049,14 @@ mod tests {
     std::fs::write(&path, b"{ not json").unwrap();
     assert!(read_entry(&path).is_none());
     let foreign = dir.join("y-prompt-cache.json");
-    std::fs::write(&foreign, format!("{{\"version\":{},\"model\":\"m\",\"saved_at\":1,\"slots\":[]}}", VERSION + 1)).unwrap();
+    std::fs::write(
+      &foreign,
+      format!(
+        "{{\"version\":{},\"model\":\"m\",\"saved_at\":1,\"slots\":[]}}",
+        VERSION + 1
+      ),
+    )
+    .unwrap();
     assert!(read_entry(&foreign).is_none());
   }
 
@@ -1046,7 +1097,10 @@ mod tests {
     assert!(pending_path(dir, "fresh").exists());
     assert!(dir.join("fresh-slot-0.bin").exists());
     assert!(!pending_path(dir, "old").exists());
-    assert!(!dir.join("old-slot-0.bin").exists(), "aged state goes with its record");
+    assert!(
+      !dir.join("old-slot-0.bin").exists(),
+      "aged state goes with its record"
+    );
 
     // A newer record pushes the total over the cap; the older one goes.
     let newer = entry("newer", 10, 700, now + 1);
@@ -1069,7 +1123,11 @@ mod tests {
     std::fs::write(&orphan, vec![7u8; 8]).unwrap();
     // Backdated past the TTL: what a save interrupted by a crash leaves behind.
     let aged = SystemTime::now() - Duration::from_secs(120);
-    std::fs::File::open(&orphan)
+    // A writable handle: on Windows setting the mtime on a read-only handle
+    // is refused with Access is denied.
+    std::fs::OpenOptions::new()
+      .write(true)
+      .open(&orphan)
       .unwrap()
       .set_modified(aged)
       .unwrap();
@@ -1102,13 +1160,13 @@ mod tests {
     assert!(slots[1].is_processing);
 
     let wrapped = serde_json::json!({ "slots": [{ "id": 2, "n_ctx": 1024 }] });
-    let slots = parse_slots(&wrapped);
-    assert_eq!(slots.len(), 1);
+    let wrapped_slots = parse_slots(&wrapped);
+    assert_eq!(wrapped_slots.len(), 1);
     // A slot that does not say it is idle is treated as busy, and one that does
     // not say its window is treated as too small to restore into: both cost a
     // save or a restore, never a wrong one.
-    assert!(slots[0].is_processing);
-    assert_eq!(slots[0].n_ctx, 1024);
+    assert!(wrapped_slots[0].is_processing);
+    assert_eq!(wrapped_slots[0].n_ctx, 1024);
 
     assert!(parse_slots(&serde_json::json!("nonsense")).is_empty());
   }

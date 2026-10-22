@@ -114,7 +114,10 @@ pub(crate) fn compose(params: &LaunchParams, allocated_port: u16) -> Vec<OsStrin
   // and the only thing that makes its save/restore endpoints reachable. Seeded
   // by `prompt_cache::enable_for_launch` for a build that advertises the flag,
   // after creating the directory — llama.cpp checks the path while parsing argv.
-  if let Some(dir) = params.launch_config.get(super::LLAMACPP_KNOB_SLOT_SAVE_PATH) {
+  if let Some(dir) = params
+    .launch_config
+    .get(super::LLAMACPP_KNOB_SLOT_SAVE_PATH)
+  {
     argv.push(super::prompt_cache::SLOT_SAVE_ARG.into());
     argv.push(dir.clone().into());
   }

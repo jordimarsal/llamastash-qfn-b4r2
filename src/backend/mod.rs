@@ -1457,11 +1457,19 @@ impl Backend for Backends {
     for_each_backend!(self, b => b.stop(ctx, launch_id, grace_secs).await)
   }
 
-  async fn save_prompt_cache(&self, ctx: &MethodContext, launch_id: &crate::daemon::registry::LaunchId) {
+  async fn save_prompt_cache(
+    &self,
+    ctx: &MethodContext,
+    launch_id: &crate::daemon::registry::LaunchId,
+  ) {
     for_each_backend!(self, b => b.save_prompt_cache(ctx, launch_id).await)
   }
 
-  async fn restore_prompt_cache(&self, ctx: &MethodContext, launch_id: &crate::daemon::registry::LaunchId) {
+  async fn restore_prompt_cache(
+    &self,
+    ctx: &MethodContext,
+    launch_id: &crate::daemon::registry::LaunchId,
+  ) {
     for_each_backend!(self, b => b.restore_prompt_cache(ctx, launch_id).await)
   }
 }

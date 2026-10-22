@@ -147,10 +147,7 @@ async fn ready_launch(client: &mut Client) -> (String, u16) {
     let body = client.call("status", None).await.expect("status");
     for row in body["models"].as_array().cloned().unwrap_or_default() {
       if row["state"]["state"] == "ready" {
-        let launch_id = row["launch_id"]
-          .as_str()
-          .expect("launch_id")
-          .to_string();
+        let launch_id = row["launch_id"].as_str().expect("launch_id").to_string();
         let port = row["port"].as_u64().expect("port") as u16;
         return (launch_id, port);
       }
@@ -191,9 +188,8 @@ async fn wait_for_model(proxy: SocketAddr, name: &str) {
 /// streams whatever the engine answers, so the body is checked as text: the
 /// point here is that the request reached a model, not what it said back.
 async fn chat(proxy: SocketAddr, model: &str, content: &str) -> String {
-  let body = format!(
-    r#"{{"model":"{model}","messages":[{{"role":"user","content":"{content}"}}]}}"#,
-  );
+  let body =
+    format!(r#"{{"model":"{model}","messages":[{{"role":"user","content":"{content}"}}]}}"#,);
   let (status, _, body) = http_post(proxy, "/v1/chat/completions", &body, &[]).await;
   let text = String::from_utf8_lossy(&body).to_string();
   assert_eq!(status, 200, "chat request through the proxy: {text}");
@@ -223,7 +219,13 @@ async fn slot_prompt(port: u16) -> u64 {
 /// was never given `--slot-save-path` gives.
 async fn try_slot_save(port: u16) -> u16 {
   let addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port);
-  let (status, _, _) = http_post(addr, "/slots/0?action=save", r#"{"filename":"probe.bin"}"#, &[]).await;
+  let (status, _, _) = http_post(
+    addr,
+    "/slots/0?action=save",
+    r#"{"filename":"probe.bin"}"#,
+    &[],
+  )
+  .await;
   status
 }
 
@@ -254,7 +256,10 @@ fn kept_records(cache: &Path) -> Vec<(PathBuf, Value)> {
     .map(|e| {
       let path = e.path();
       let text = std::fs::read_to_string(&path).expect("record readable");
-      (path, serde_json::from_str::<Value>(&text).expect("record json"))
+      (
+        path,
+        serde_json::from_str::<Value>(&text).expect("record json"),
+      )
     })
     .collect()
 }
@@ -341,14 +346,18 @@ async fn a_model_unloaded_by_the_daemon_gets_its_prompt_back() {
 
   // 5) The state is spent, and what remains says so.
   let records = kept_records(&cache);
-  assert_eq!(records.len(), 1, "the record stays as a record of what happened");
+  assert_eq!(
+    records.len(),
+    1,
+    "the record stays as a record of what happened"
+  );
   let (consumed_path, consumed) = &records[0];
   assert!(
     consumed_path
       .file_name()
       .and_then(|n| n.to_str())
       .is_some_and(|n| n.ends_with("-prompt-cache.consumed.json")),
-      "{consumed_path:?} should be the consumed record"
+    "{consumed_path:?} should be the consumed record"
   );
   assert!(consumed["restored_at"].is_u64(), "{consumed:?}");
   assert!(
