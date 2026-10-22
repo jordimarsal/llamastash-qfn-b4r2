@@ -1006,7 +1006,7 @@ pub trait Backend {
   /// Last chance to keep anything a supervised launch has computed, called before
   /// its child is signalled — the one moment a process-per-model launch's
   /// engine-side state can outlive it. Called from
-  /// [`stop_supervised`](crate::daemon::launch_service::stop_supervised), so it
+  /// `stop_supervised` (in `crate::daemon::launch_service`), so it
   /// covers every stop: `stop_model`, `make_room`, the idle sweep, shutdown.
   /// Default: nothing. A backend that uses it must return promptly — the caller is
   /// already waiting for a stop, and an eviction a request is waiting on pays for

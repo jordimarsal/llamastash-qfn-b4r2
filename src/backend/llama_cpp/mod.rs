@@ -205,7 +205,7 @@ pub struct LlamaCppConfig {
   /// Hand a stopped launch's prompt cache to the engine and take it back on the
   /// next launch, so an evicted conversation is reprocessed from where it stopped
   /// instead of from token zero (`factory: true`). See
-  /// [`crate::backend::llama_cpp::prompt_cache`] for what is written, where, and
+  /// `crate::backend::llama_cpp::prompt_cache` for what is written, where, and
   /// when.
   #[serde(default = "default_true")]
   pub prompt_cache: bool,

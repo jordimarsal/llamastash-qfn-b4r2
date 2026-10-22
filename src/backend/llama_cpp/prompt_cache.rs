@@ -202,9 +202,7 @@ pub fn list_cache_files(dir: &Path) -> std::io::Result<Vec<CacheFile>> {
     let Some(file_name) = entry.file_name().to_str().map(str::to_string) else {
       continue;
     };
-    let modified = metadata
-      .modified()
-      .unwrap_or_else(|_| SystemTime::UNIX_EPOCH);
+    let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
     out.push(CacheFile {
       path: entry.path(),
       file_name,
@@ -243,7 +241,7 @@ pub fn prune_plan(files: &[CacheFile], cap_bytes: u64) -> Vec<PathBuf> {
     .iter()
     .filter(|file| is_slot_file(&file.file_name))
     .collect();
-  ordered.sort_by(|a, b| b.modified.cmp(&a.modified));
+  ordered.sort_by_key(|file| std::cmp::Reverse(file.modified));
   let mut doomed = Vec::new();
   let mut used = 0u64;
   for file in ordered {
@@ -622,12 +620,11 @@ async fn read_response<S: AsyncRead + Unpin>(sock: &mut S) -> Result<Value, Stri
   if status >= 400 {
     return Err(engine_error(status, &body));
   }
-  let payload;
-  if chunked {
-    payload = decode_chunked(&body)?;
+  let payload = if chunked {
+    decode_chunked(&body)?
   } else {
-    payload = body;
-  }
+    body
+  };
   serde_json::from_slice(&payload).map_err(|e| format!("unreadable response: {e}"))
 }
 
@@ -658,10 +655,7 @@ fn engine_error(status: u16, body: &[u8]) -> String {
 fn decode_chunked(tail: &[u8]) -> Result<Vec<u8>, String> {
   let mut out = Vec::new();
   let mut rest = tail;
-  loop {
-    let Some(size) = read_chunk_size(&mut rest) else {
-      break;
-    };
+  while let Some(size) = read_chunk_size(&mut rest) {
     if size == 0 {
       break;
     }
@@ -1073,20 +1067,20 @@ mod tests {
 
     // A declared length over the ceiling is refused before a single body byte is
     // read, so the cap costs nothing on a response that is far too big.
-    let (mut stream, mut writer) = tokio::io::duplex(4 * 1024 * 1024);
+    let (mut capped_stream, mut capped_writer) = tokio::io::duplex(4 * 1024 * 1024);
     tokio::spawn(async move {
       tokio::io::AsyncWriteExt::write_all(
-        &mut writer,
+        &mut capped_writer,
         b"HTTP/1.1 200 OK\r\nContent-Length: 999999999999\r\n\r\n",
       )
       .await
       .unwrap();
-      tokio::io::AsyncWriteExt::shutdown(&mut writer)
+      tokio::io::AsyncWriteExt::shutdown(&mut capped_writer)
         .await
         .unwrap();
     });
-    let err = read_response(&mut stream).await.unwrap_err();
-    assert!(err.contains("over"), "{err}");
+    let capped_err = read_response(&mut capped_stream).await.unwrap_err();
+    assert!(capped_err.contains("over"), "{capped_err}");
   }
 
   #[test]
